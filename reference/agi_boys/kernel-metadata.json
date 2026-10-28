@@ -1,0 +1,27 @@
+{
+  "id": "romantamrazov/the-agi-boys-i-am-better",
+  "id_no": 118945269,
+  "title": "The AGI Boys | I AM BETTER",
+  "code_file": "the-agi-boys-i-am-better.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": false,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "dfranzen/pennyroyal-v253",
+    "dfranzen/taaf-kaggle-source-bundle-copy"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "arc-prize-2026-arc-agi-3"
+  ],
+  "model_sources": [
+    "dfranzen/albucino-qwen3-8-flash-next-drafter/Transformers/default/1",
+    "dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/Transformers/default/1"
+  ]
+}
