@@ -38,6 +38,14 @@ from arc_rl.harness_env import HarnessConfig, run_game_subprocess
 from arc_rl.harness_proxy import HarnessProxy, TurnOutput
 
 
+def _tok_id(entry: dict) -> int:
+    """Token id of one top-logprob entry. vLLM 0.32's `/inference/v1/generate` returns `{"token_id": 8, ...}`;
+    TRL @ e29597a (and older vLLM) expects `{"token": "token_id:8", ...}`. Accept both."""
+    if entry.get("token_id") is not None:
+        return int(entry["token_id"])
+    return int(str(entry["token"]).removeprefix("token_id:"))
+
+
 def game_reward(result: dict, ctx_stats: dict, weights: dict) -> float | None:
     """Scalar reward for one harness rollout.
 
@@ -55,11 +63,16 @@ def game_reward(result: dict, ctx_stats: dict, weights: dict) -> float | None:
     tool_err = ctx_stats.get("n_tool_errors", 0) / n_calls
     gen_tok = ctx_stats.get("completion_tokens", 0)
     tok_per_action = gen_tok / actions
-    acted = 1.0 if result.get("actions", 0) > 0 else 0.0
+    # Exploration: distinct boards reached, and the share of actions that changed the board (vs no-ops).
+    novelty = min(float(result.get("distinct_states", 0)) / 40.0, 1.0)
+    effective = float(result.get("effective_actions", 0)) / actions
+    game_overs = float(result.get("game_overs", 0))
     r = (
         weights.get("level", 1.0) * levels
         + weights.get("score", 0.01) * score
-        + weights.get("acted", 0.1) * acted
+        + weights.get("novelty", 0.4) * novelty
+        + weights.get("effective", 0.2) * effective
+        - weights.get("game_over", 0.02) * min(game_overs, 10.0)
         - weights.get("tool_err", 0.3) * tool_err
         - weights.get("tok_per_action", 0.05) * min(tok_per_action / 1000.0, 5.0)
         - weights.get("truncated", 0.05) * ctx_stats.get("n_truncated", 0)
@@ -127,8 +140,7 @@ class ArcHarnessLoop(_AsyncRolloutLoop):
                 lps = [t["logprob"] for t in content]
                 slp = None
                 if self.num_sampler_logprobs:
-                    slp = [{int(str(tt["token"]).removeprefix("token_id:")): tt["logprob"] for tt in t["top_logprobs"]}
-                           for t in content]
+                    slp = [{_tok_id(tt): tt["logprob"] for tt in t["top_logprobs"]} for t in content]
                 return choice["token_ids"], lps, choice["sampling_mask"], slp
             except Exception:
                 if use_model == self._request_model:
@@ -167,7 +179,7 @@ class ArcHarnessLoop(_AsyncRolloutLoop):
         reward = game_reward(result, stats, self.reward_weights)
         turns: list[TurnRecord] = ctx.turns
         rec = {"t": time.time(), "group": group_id, "game": game, "model": ctx.model, "reward": reward,
-               "result": {k: result.get(k) for k in ("final_score", "levels_completed", "actions", "error", "wall_s")},
+               "result": {k: result.get(k) for k in ("final_score", "levels_completed", "actions", "distinct_states", "effective_actions", "game_overs", "error", "wall_s")},
                **stats}
         with self._results_path.open("a") as f:
             f.write(json.dumps(rec) + "\n")

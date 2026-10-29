@@ -35,6 +35,24 @@ def vllm_up() -> bool:
     return subprocess.run("curl -sf http://127.0.0.1:8000/v1/models > /dev/null", shell=True).returncode == 0
 
 
+def unload_stale_adapters() -> None:
+    """A previous (killed) training run leaves `trl-policy-vN` adapters registered in vLLM; a new run re-publishing
+    `trl-policy-v1` would then be rejected. Unload them before training."""
+    import json
+    import urllib.request
+
+    models = json.loads(urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=30).read())["data"]
+    for m in models:
+        if m["id"].startswith("trl-policy-"):
+            req = urllib.request.Request(
+                "http://127.0.0.1:8000/v1/unload_lora_adapter",
+                data=json.dumps({"lora_name": m["id"]}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=60).read()
+            log(f"unloaded stale adapter {m['id']}")
+
+
 def main() -> None:
     stage = sys.argv[1] if len(sys.argv) > 1 else "baseline"
     if stage == "trainsmoke":
@@ -58,6 +76,7 @@ def main() -> None:
         sh(f"{eval_cmd} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
            f"--out /content/runs/baseline_holdout", "/content/baseline.log")
     if stage in ("train", "train_only", "all"):
+        unload_stale_adapters()
         extra = os.environ.get("TRAIN_ARGS", "")
         sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model Qwen/Qwen3.5-9B --vllm http://127.0.0.1:8000 "
            f"--bundle work_bundle --env-dir data/environment_files --out {os.environ.get('TRAIN_OUT', '/content/runs/grpo1')} {extra}",

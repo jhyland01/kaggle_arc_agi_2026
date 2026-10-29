@@ -117,6 +117,18 @@ def harness_env(cfg: HarnessConfig, base_url: str, model_name: str) -> dict[str,
     return env
 
 
+def _die_with_parent() -> None:
+    """Linux: SIGKILL this harness subprocess if its parent (the rollout worker / eval runner) dies, so a killed
+    training run cannot leave orphaned games still sending requests to the next run."""
+    try:
+        import ctypes  # noqa: PLC0415
+        import signal  # noqa: PLC0415
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG = 1
+    except Exception:  # noqa: BLE001 - not Linux (local mac tests)
+        pass
+
+
 async def run_game_subprocess(
     cfg: HarnessConfig, game: str, base_url: str, model_name: str, job_dir: Path, timeout_s: float | None = None
 ) -> dict:
@@ -137,7 +149,8 @@ async def run_game_subprocess(
     ]
     log = open(job_dir / "harness.log", "w")  # noqa: SIM115
     proc = await asyncio.create_subprocess_exec(
-        *cmd, env=harness_env(cfg, base_url, model_name), stdout=log, stderr=asyncio.subprocess.STDOUT
+        *cmd, env=harness_env(cfg, base_url, model_name), stdout=log, stderr=asyncio.subprocess.STDOUT,
+        preexec_fn=_die_with_parent,
     )
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout_s or (cfg.max_runtime_s + 600))

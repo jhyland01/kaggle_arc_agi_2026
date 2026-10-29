@@ -53,6 +53,23 @@ def main() -> None:
     from transformers import AutoConfig, AutoTokenizer
 
     from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
+    from trl.experimental.async_grpo import packing as trl_packing
+
+    # TRL's tree-packing attention loads FlashAttention-4 on every compute capability >= 10. FA4 targets datacenter
+    # Blackwell (sm100) and fails to import on the RTX PRO 6000 (sm120, the Kaggle/Colab-G4 GPU) with vLLM 0.32's
+    # cutlass-dsl. TRL only needs `flash_attn_varlen_func` (causal, bottom-right aligned), which FlashAttention-2
+    # provides with the same signature; verified against a reference implementation on sm120 (colab/probe_varlen.py).
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
+        from functools import cache
+
+        from kernels import get_kernel
+
+        @cache
+        def _fa2_varlen():
+            return get_kernel("kernels-community/flash-attn2", version=4)
+
+        trl_packing._flash_attn = _fa2_varlen
+        print("tree attention: using FlashAttention-2 (kernels-community/flash-attn2 v4) on sm120", flush=True)
 
     from arc_rl.eval_games import HOLDOUT_GAMES, TRAIN_GAMES
     from arc_rl.harness_env import HarnessConfig

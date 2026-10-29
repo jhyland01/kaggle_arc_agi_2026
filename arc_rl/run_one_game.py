@@ -104,6 +104,24 @@ def main() -> None:
             generated_tokens=int(sum(getattr(r, "generated_tokens", 0) or 0 for r in hist))
             + int(getattr(run, "final_generated_tokens", 0) or 0),
         )
+        # Dense, game-grounded exploration stats (used for reward shaping; levels are rare for small models).
+        try:
+            import hashlib  # noqa: PLC0415
+
+            states = list(getattr(run, "intermediate_states", []) or [])
+            hashes, effective, game_overs, prev = set(), 0, 0, None
+            for st in states:
+                h = hashlib.blake2b(st.frame.data.tobytes(), digest_size=12).hexdigest()
+                hashes.add(h)
+                if prev is not None and h != prev:
+                    effective += 1
+                prev = h
+                if str(getattr(st.raw.state, "name", st.raw.state)).upper() == "GAME_OVER":
+                    game_overs += 1
+            result.update(distinct_states=len(hashes), effective_actions=effective, game_overs=game_overs,
+                          n_states=len(states))
+        except Exception as exc:  # noqa: BLE001
+            result["stats_error"] = repr(exc)
     Path(args.out).write_text(json.dumps(result, indent=2))
     print("RESULT", json.dumps(result))
 
