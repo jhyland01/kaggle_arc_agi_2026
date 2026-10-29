@@ -113,6 +113,7 @@ def main() -> None:
         per_device_train_batch_size=1,
         bf16=True,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         model_init_kwargs={"dtype": torch.bfloat16},
         num_generations=args.num_generations,
         max_completion_length=args.max_output,
@@ -186,6 +187,13 @@ def main() -> None:
         rollout_worker=worker,
     )
     model = trainer.model
+    # Make the frozen lower layers actually free. With PEFT + gradient checkpointing TRL calls
+    # `enable_input_require_grads()`, which marks the embedding output as requiring grad so reentrant checkpointing
+    # can reach the adapters -- but that also drags autograd (saved activations + backward) through every frozen
+    # layer. Non-reentrant checkpointing doesn't need it, so drop the hook: autograd now starts at the first LoRA
+    # layer, and layers below it run forward-only.
+    if hasattr(model, "disable_input_require_grads"):
+        model.disable_input_require_grads()
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"trainable params {n_train / 1e6:.1f}M / {n_all / 1e9:.2f}B; LoRA layers {layers[0]}..{layers[-1]}", flush=True)

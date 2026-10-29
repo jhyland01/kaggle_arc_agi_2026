@@ -57,7 +57,7 @@ def main() -> None:
     stage = sys.argv[1] if len(sys.argv) > 1 else "baseline"
     if stage == "trainsmoke":
         os.environ.setdefault("TRAIN_OUT", "/content/runs/grpo_smoke")
-        os.environ.setdefault("TRAIN_ARGS", "--max-steps 2 --num-generations 2 --max-inflight 4 --grad-accum 2 --rollout-runtime-s 150 --save-steps 1")
+        os.environ.setdefault("TRAIN_ARGS", "--max-steps 2 --num-generations 2 --max-inflight 4 --grad-accum 2 --rollout-runtime-s 150 --save-steps 1 --token-budget 32768")
         stage = "train_only"
     t0 = time.time()
     log(f"driver start, stage={stage}")
