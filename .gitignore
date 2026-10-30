@@ -5,3 +5,4 @@ reference/agi_boys/output/
 __pycache__/
 *.pyc
 arc.tar.gz
+runs/grpo1/final_adapter/*.safetensors
