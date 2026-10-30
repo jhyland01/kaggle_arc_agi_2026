@@ -20,9 +20,10 @@ os.environ.update({
     "EVAL_EXTRA": COMMON_MODEL_ARGS,
     "TRAIN_OUT": "/content/runs/grpo38",
     "TRAIN_ARGS": (
-        f"--fp8-base --train-layers 10 --max-steps 30 --num-generations 4 --max-inflight 6 "
-        f"--grad-accum 2 --rollout-runtime-s 420 --save-steps 5 --token-budget 32768 --max-staleness 4 "
-        f"--lr 2e-5 {COMMON_MODEL_ARGS} --reward-weights '" + json.dumps({"tok_per_action": 0.15}) + "'"
+        f"--fp8-base --train-layers 10 --max-steps 28 --num-generations 4 --max-inflight 6 "
+        f"--grad-accum 2 --rollout-runtime-s 360 --save-steps 4 --token-budget 32768 --max-staleness 4 "
+        f"--lr 2e-5 {COMMON_MODEL_ARGS} --reward-weights '"
+        + json.dumps({"tok_per_action": 0.20, "novelty": 0.50}) + "'"
     ),
     "ADAPTER": "/content/runs/grpo38/final_adapter",
     "ADAPTER_NAME": "arc-grpo38",
