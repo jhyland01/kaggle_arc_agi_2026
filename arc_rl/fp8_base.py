@@ -22,6 +22,26 @@ def _dequant_fp8(weight: torch.Tensor, scale_inv: torch.Tensor, block: tuple[int
     return (weight.float() * s).to(torch.bfloat16)
 
 
+class DequantFP8Linear(nn.Module):
+    """Frozen FP8 (block-scaled) linear layer that dequantizes to bf16 on the fly in forward.
+
+    Replaces transformers' `FP8Linear`, whose triton/hub kernel needs `kernels<0.18` -- incompatible with the
+    `kernels` version the FlashAttention-2 tree-attention swap needs. Only one layer's weights are ever materialized
+    in bf16 at a time, so memory stays at FP8 levels; weights are frozen (no grads)."""
+
+    def __init__(self, src) -> None:
+        super().__init__()
+        self.in_features, self.out_features = src.in_features, src.out_features
+        self.block = tuple(src.block_size) if src.block_size is not None else (1, 1)
+        self.register_buffer("weight", src.weight.data, persistent=False)
+        self.register_buffer("weight_scale_inv", src.weight_scale_inv.data, persistent=False)
+        self.bias = None if src.bias is None else nn.Parameter(src.bias.data.to(torch.bfloat16), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = _dequant_fp8(self.weight, self.weight_scale_inv, self.block).to(x.dtype)
+        return nn.functional.linear(x, w, None if self.bias is None else self.bias.to(x.dtype))
+
+
 def load_fp8_base_with_bf16_top(model_id: str, top_layers: int, device: str = "cuda"):
     from transformers import AutoConfig, AutoModelForImageTextToText  # noqa: PLC0415
     from transformers.integrations.finegrained_fp8 import FP8Linear  # noqa: PLC0415
@@ -37,10 +57,11 @@ def load_fp8_base_with_bf16_top(model_id: str, top_layers: int, device: str = "c
             if not isinstance(child, FP8Linear):
                 continue
             full = f"{name}.{child_name}"
-            if ".layers." not in full or "language_model" not in full:
-                continue
-            layer_idx = int(full.split(".layers.")[1].split(".")[0])
-            if layer_idx < first:
+            in_top = False
+            if ".layers." in full and "language_model" in full:
+                in_top = int(full.split(".layers.")[1].split(".")[0]) >= first
+            if not in_top:
+                setattr(module, child_name, DequantFP8Linear(child))  # frozen, stays FP8 in memory
                 continue
             block = tuple(child.block_size) if child.block_size is not None else (1, 1)
             lin = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None,
