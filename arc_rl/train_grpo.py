@@ -22,7 +22,9 @@ os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
+    ap.add_argument("--model", default="Qwen/Qwen3.5-9B", help="checkpoint the trainer loads (and vLLM serves)")
+    ap.add_argument("--fp8-base", action="store_true",
+                    help="checkpoint is fine-grained FP8: keep frozen layers FP8, dequantize LoRA layers to bf16")
     ap.add_argument("--vllm", default="http://127.0.0.1:8000")
     ap.add_argument("--out", required=True)
     ap.add_argument("--bundle", default="work_bundle")
@@ -92,6 +94,11 @@ def main() -> None:
     cfg = AutoConfig.from_pretrained(args.model)
     n_layers = getattr(getattr(cfg, "text_config", cfg), "num_hidden_layers")
     layers = list(range(n_layers - args.train_layers, n_layers))
+    model_arg = args.model
+    if args.fp8_base:
+        from arc_rl.fp8_base import load_fp8_base_with_bf16_top
+
+        model_arg, layers = load_fp8_base_with_bf16_top(args.model, args.train_layers)
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=2 * args.lora_r,
@@ -179,7 +186,7 @@ def main() -> None:
     )
 
     trainer = AsyncGRPOTrainer(
-        model=args.model,
+        model=model_arg,
         args=config,
         train_dataset=dataset,
         processing_class=tok,

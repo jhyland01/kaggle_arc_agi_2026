@@ -27,6 +27,7 @@ nohup vllm serve "$MODEL" \
   --api-server-count "${API_SERVERS:-1}" \
   --weight-transfer-config '{"backend":"nccl"}' \
   --enable-lora --max-lora-rank 16 --max-loras 6 \
+  ${KV_DTYPE:+--kv-cache-dtype "$KV_DTYPE"} \
   > "$LOG" 2>&1 &
 echo $! > /content/vllm.pid
 for i in $(seq 1 180); do

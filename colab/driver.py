@@ -60,18 +60,21 @@ def main() -> None:
         os.environ.setdefault("TRAIN_ARGS", "--max-steps 2 --num-generations 2 --max-inflight 4 --grad-accum 2 --rollout-runtime-s 150 --save-steps 1 --token-budget 32768")
         stage = "train_only"
     t0 = time.time()
-    log(f"driver start, stage={stage}")
+    model = os.environ.setdefault("MODEL", "Qwen/Qwen3.5-9B")  # also read by setup.sh / launch_vllm.sh
+    log(f"driver start, stage={stage}, model={model}")
     if not Path("/content/setup.done").exists():
         sh("bash /content/arc/colab/setup.sh", "/content/setup.log")
         Path("/content/setup.done").write_text("ok")
     if not vllm_up():
         sh("bash /content/arc/colab/launch_vllm.sh", "/content/vllm_launch.log")
     log("vLLM is up")
-    eval_cmd = "PYTHONPATH=/content/arc python -m arc_rl.eval_games --bundle work_bundle --env-dir data/environment_files"
-    if not Path("/content/smoke.done").exists():
-        sh(f"{eval_cmd} --games ft09 --passes 1 --concurrency 1 --max-runtime-s 180 --max-actions 10 "
-           f"--out /content/runs/smoke", "/content/smoke.log")
-        Path("/content/smoke.done").write_text("ok")
+    eval_cmd = (f"PYTHONPATH=/content/arc python -m arc_rl.eval_games --bundle work_bundle "
+                f"--env-dir data/environment_files --tokenizer {model}")
+    smoke_flag = Path(f"/content/smoke_{model.replace('/', '_')}.done")
+    if not smoke_flag.exists():
+        sh(f"{eval_cmd} --model {model} --games ft09 --passes 1 --concurrency 1 --max-runtime-s 180 --max-actions 10 "
+           f"--out /content/runs/smoke_{model.replace('/', '_')}", "/content/smoke.log")
+        smoke_flag.write_text("ok")
     if stage == "confirm":
         # Baseline and adapter evaluated simultaneously (10 concurrent games each), so both see the same GPU load.
         adapter = os.environ.get("ADAPTER", "/content/adapters/arc-grpo1")
@@ -80,16 +83,17 @@ def main() -> None:
         sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
            f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/confirm.log", check=False)
         common = f"--games holdout --passes {passes} --concurrency 10 --max-runtime-s 600"
-        sh(f"( {eval_cmd} --model Qwen/Qwen3.5-9B {common} --out /content/runs/confirm_base > /content/confirm_base.log 2>&1 & "
+        sh(f"( {eval_cmd} --model {model} {common} --out /content/runs/confirm_base > /content/confirm_base.log 2>&1 & "
            f"{eval_cmd} --model {name} {common} --out /content/runs/confirm_{name} > /content/confirm_adapter.log 2>&1 & wait )",
            "/content/confirm.log")
     if stage in ("baseline", "all"):
-        sh(f"{eval_cmd} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
-           f"--out /content/runs/baseline_holdout", "/content/baseline.log")
+        out = os.environ.get("BASELINE_OUT", "/content/runs/baseline_holdout")
+        sh(f"{eval_cmd} --model {model} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
+           f"--out {out}", "/content/baseline.log")
     if stage in ("train", "train_only", "all"):
         unload_stale_adapters()
         extra = os.environ.get("TRAIN_ARGS", "")
-        sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model Qwen/Qwen3.5-9B --vllm http://127.0.0.1:8000 "
+        sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model {model} --vllm http://127.0.0.1:8000 "
            f"--bundle work_bundle --env-dir data/environment_files --out {os.environ.get('TRAIN_OUT', '/content/runs/grpo1')} {extra}",
            "/content/train.log")
     if stage in ("posteval", "train", "all"):
