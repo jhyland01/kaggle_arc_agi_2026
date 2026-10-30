@@ -35,6 +35,26 @@ def vllm_up() -> bool:
     return subprocess.run("curl -sf http://127.0.0.1:8000/v1/models > /dev/null", shell=True).returncode == 0
 
 
+def stop_vllm() -> None:
+    """Stop the running vLLM server (started by launch_vllm.sh, which records its PID) so another model can load."""
+    import signal
+
+    pid_file = Path("/content/vllm.pid")
+    if pid_file.exists():
+        try:
+            # SIGTERM to the vLLM API server only (it shuts its engine core down); it shares the kernel's process
+            # group, so killpg here would take the Jupyter kernel down with it.
+            os.kill(int(pid_file.read_text().strip()), signal.SIGTERM)
+        except (ProcessLookupError, ValueError):
+            pass
+    for _ in range(60):
+        if not vllm_up():
+            break
+        time.sleep(2)
+    time.sleep(10)  # let the engine core release GPU memory
+    log("previous vLLM server stopped")
+
+
 def unload_stale_adapters() -> None:
     """A previous (killed) training run leaves `trl-policy-vN` adapters registered in vLLM; a new run re-publishing
     `trl-policy-v1` would then be rejected. Unload them before training."""
@@ -65,6 +85,10 @@ def main() -> None:
     if not Path("/content/setup.done").exists():
         sh("bash /content/arc/colab/setup.sh", "/content/setup.log")
         Path("/content/setup.done").write_text("ok")
+    if os.environ.get("SWAP_VLLM") == "1" and vllm_up():
+        served = subprocess.run("curl -s http://127.0.0.1:8000/v1/models", shell=True, capture_output=True, text=True).stdout
+        if model not in served:
+            stop_vllm()
     if not vllm_up():
         sh("bash /content/arc/colab/launch_vllm.sh", "/content/vllm_launch.log")
     log("vLLM is up")
