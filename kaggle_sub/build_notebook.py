@@ -19,13 +19,14 @@ from pathlib import Path
 OUT_DIR = Path(__file__).resolve().parent
 
 
-def md_cell(text: str) -> dict:
-    return {"cell_type": "markdown", "metadata": {}, "source": text}
+def md_cell(text: str, cid: str = "md0") -> dict:
+    return {"cell_type": "markdown", "id": cid, "metadata": {}, "source": text}
 
 
-def code_cell(code: str) -> dict:
+def code_cell(code: str, cid: str = "c0") -> dict:
     return {
         "cell_type": "code",
+        "id": cid,
         "execution_count": None,
         "metadata": {},
         "outputs": [],
@@ -53,6 +54,7 @@ import socket
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import threading
 import time
 import urllib.request
@@ -81,7 +83,9 @@ os.environ["LIBRARY_PATH"] = os.pathsep.join(
 
 WORKING_DIR = Path("/kaggle/working")
 WORKING_DIR.mkdir(parents=True, exist_ok=True)
-print(f"taaf.kaggle: TRUE_SUBMISSION={TRUE_SUBMISSION}")
+print(f"taaf.kaggle: TRUE_SUBMISSION={TRUE_SUBMISSION}, kernel python={sys.version.split()[0]} ({sys.executable})", flush=True)
+gpu_info = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+print(f"GPU check: rc={gpu_info.returncode}, out={gpu_info.stdout.strip()!r}, err={gpu_info.stderr.strip()!r}", flush=True)
 
 # LoRA variant selector:
 #   "final_adapter_blend50" -> lora_alpha=16 (0.5x multimodal-balanced RL policy, recommended with images)
@@ -110,6 +114,36 @@ LORA_DATASET_DIR = PATCH_PATH.parent
 LORA_ADAPTER_DIR = LORA_DATASET_DIR / LORA_VARIANT
 assert (LORA_ADAPTER_DIR / "adapter_model.safetensors").is_file(), f"Missing LoRA weights at {LORA_ADAPTER_DIR}"
 
+
+# Ensure Python 3.12 for cp312 vLLM 0.19 wheelhouse even if Kaggle container runs Python 3.13+
+def _ensure_python312(lora_dataset_dir: Path) -> str:
+    if sys.version_info[:2] == (3, 12):
+        return sys.executable
+    candidates = [
+        shutil.which("python3.12"),
+        "/usr/bin/python3.12",
+        "/usr/local/bin/python3.12",
+        "/opt/conda/bin/python3.12",
+    ]
+    for c in candidates:
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return str(Path(c).resolve())
+    standalone_tar = lora_dataset_dir / "cpython-3.12-linux-x86_64.blob"
+    py312_bin = Path("/tmp/py312/python/bin/python3.12")
+    if not py312_bin.is_file() and standalone_tar.is_file():
+        print(f"Extracting standalone Python 3.12 from {standalone_tar} -> /tmp/py312...", flush=True)
+        Path("/tmp/py312").mkdir(parents=True, exist_ok=True)
+        with tarfile.open(standalone_tar, "r:gz") as tf:
+            tf.extractall("/tmp/py312")
+        py312_bin.chmod(0o755)
+    if py312_bin.is_file():
+        return str(py312_bin)
+    return sys.executable
+
+
+VLLM_PYTHON = _ensure_python312(LORA_DATASET_DIR)
+print(f"Selected VLLM_PYTHON: {VLLM_PYTHON}", flush=True)
+
 # 3. Locate vLLM wheelhouse and Qwen3.8 transformers 5.8 overlay wheels
 vllm_whl = _find_by_predicate(INPUT_ROOT, lambda p: p.is_file() and p.name.startswith("vllm-0.19.0-") and p.suffix == ".whl", "vllm 0.19.0 wheel")
 WHEELHOUSE_DIR = vllm_whl.parent
@@ -135,11 +169,14 @@ print("LORA_ADAPTER_DIR:", LORA_ADAPTER_DIR)
 print("WHEELHOUSE_DIR  :", WHEELHOUSE_DIR)
 print("MODEL_DIR       :", MODEL_DIR)
 
-# Apply AGI-Boys harness patch to writable copy
+# Apply AGI-Boys harness patch to writable copy (normalize CRLF and ensure trailing newline!)
 BUNDLE_DIR = Path("/kaggle/taaf-kaggle-source-share")
 shutil.rmtree(BUNDLE_DIR, ignore_errors=True)
 shutil.copytree(ORIG_BUNDLE_DIR, BUNDLE_DIR, symlinks=True)
-subprocess.run(["git", "apply", "--include=ARC3-Inference/*", "-v", str(PATCH_PATH)], cwd=str(BUNDLE_DIR / "src"), check=True)
+clean_patch = PATCH_PATH.read_bytes().replace(b"\\r\\n", b"\\n").rstrip(b"\\n") + b"\\n"
+TMP_PATCH = Path("/tmp/harness-changes-clean.patch")
+TMP_PATCH.write_bytes(clean_patch)
+subprocess.run(["git", "apply", "--include=ARC3-Inference/*", "-v", str(TMP_PATCH)], cwd=str(BUNDLE_DIR / "src"), check=True)
 print("Harness patch applied cleanly.")
 """
 
@@ -184,17 +221,30 @@ def precache(*paths, delay=0, threads=8) -> None:
 precache_wheels = threading.Thread(target=precache, args=(WHEELHOUSE_DIR,), daemon=True)
 precache_wheels.start()
 
-# Install offline competition arc-agi runtime
+# Install offline competition arc-agi runtime (with Python 3.13 --no-deps fallback when cp312 pillow>=12.1.1 is absent)
 comp_wheels = _find_by_predicate(INPUT_ROOT, lambda p: p.is_dir() and p.name == "arc_agi_3_wheels", "arc_agi_3_wheels")
 COMPETITION_DIR = comp_wheels.parent
-subprocess.check_call(
+arc_rc = subprocess.call(
     [
         sys.executable, "-m", "pip", "install", "--quiet", "--no-index",
         "--no-warn-conflicts", "--disable-pip-version-check",
         "--find-links", str(comp_wheels), "arc-agi",
     ],
     stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
 )
+if arc_rc != 0:
+    print(f"Standard arc-agi install returned {arc_rc} on Python {sys.version.split()[0]}; installing pure-Python wheels with --no-deps...", flush=True)
+    subprocess.check_call(
+        [
+            sys.executable, "-m", "pip", "install", "--quiet", "--no-index", "--no-deps",
+            "--disable-pip-version-check", "--find-links", str(comp_wheels),
+            "arc-agi", "arcengine", "python-dotenv",
+        ],
+        stdout=subprocess.DEVNULL,
+    )
+import arc_agi, arcengine  # verify offline import immediately
+print("Verified arc_agi + arcengine import.", flush=True)
 precache_wheels.join()
 
 # Expose patched TAAF + ARC3-Inference repos on sys.path and child .pth
@@ -224,9 +274,9 @@ SERVER_BASE_URL = f"http://{SERVED_MODEL_HOST}:{SERVED_MODEL_PORT}/v1"
 
 def vllm_env() -> dict[str, str]:
     env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(SITE_PACKAGES) if not existing else f"{SITE_PACKAGES}{os.pathsep}{existing}"
+    env["PYTHONPATH"] = str(SITE_PACKAGES)
     env.update({
+        "PYTHONNOUSERSITE": "1",
         "USE_TF": "0",
         "TRANSFORMERS_NO_TF": "1",
         "TRANSFORMERS_NO_TORCHVISION": "1",
@@ -243,23 +293,41 @@ def install_vllm_runtime() -> None:
         return
     shutil.rmtree(SITE_PACKAGES, ignore_errors=True)
     SITE_PACKAGES.mkdir(parents=True, exist_ok=True)
+    py_ver = subprocess.check_output([VLLM_PYTHON, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"], text=True).strip()
+    print(f"Installing vLLM wheelhouse using {VLLM_PYTHON} (Python {py_ver})...", flush=True)
     req_lock = WHEELHOUSE_DIR / "requirements.lock"
-    subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install", "--no-index",
-            "--find-links", str(WHEELHOUSE_DIR), "--requirement", str(req_lock),
-            "--target", str(SITE_PACKAGES), "--upgrade", "--ignore-installed",
-            "--only-binary", ":all:", "--no-compile",
-            "--disable-pip-version-check", "--no-warn-conflicts",
-        ],
-        check=True,
-    )
+    if py_ver == "3.12":
+        subprocess.run(
+            [
+                VLLM_PYTHON, "-m", "pip", "install", "--no-index",
+                "--find-links", str(WHEELHOUSE_DIR), "--requirement", str(req_lock),
+                "--target", str(SITE_PACKAGES), "--upgrade", "--ignore-installed",
+                "--only-binary", ":all:", "--no-compile",
+                "--disable-pip-version-check", "--no-warn-conflicts",
+            ],
+            check=True,
+        )
+    else:
+        # Python 3.13 fallback: install abi3 + py3-none-any wheels into SITE_PACKAGES while keeping container cp313 C-extensions
+        compat_whls = sorted(
+            str(w) for w in WHEELHOUSE_DIR.glob("*.whl")
+            if ("-none-any.whl" in w.name or "-abi3-" in w.name)
+            and not w.name.startswith(("transformers-", "huggingface_hub-", "pip-", "setuptools-", "wheel-"))
+        )
+        subprocess.run(
+            [
+                VLLM_PYTHON, "-m", "pip", "install", "--no-index", "--no-deps",
+                "--target", str(SITE_PACKAGES), "--upgrade", "--no-compile",
+                "--disable-pip-version-check", *compat_whls,
+            ],
+            check=True,
+        )
     for pat in ("transformers", "transformers-*.dist-info", "huggingface_hub", "huggingface_hub-*.dist-info"):
         for p in SITE_PACKAGES.glob(pat):
             shutil.rmtree(p) if p.is_dir() else p.unlink()
     subprocess.run(
         [
-            sys.executable, "-m", "pip", "install", "--no-index", "--no-deps",
+            VLLM_PYTHON, "-m", "pip", "install", "--no-index", "--no-deps",
             "--target", str(SITE_PACKAGES), "--upgrade", "--force-reinstall",
             "--no-compile", "--disable-pip-version-check",
             str(TF58_WHEEL), str(HFHUB_WHEEL),
@@ -267,15 +335,30 @@ def install_vllm_runtime() -> None:
         check=True,
     )
     INSTALL_STAMP.write_text("ok\\n")
-    print("Offline vLLM 0.19.0 + transformers 5.8.0 runtime installed.", flush=True)
+    print("Offline vLLM + transformers 5.8.0 runtime installed.", flush=True)
 
 
 precache_model_thread = threading.Thread(target=precache, args=(MODEL_DIR,), kwargs={"delay": 5, "threads": 4}, daemon=True)
 precache_model_thread.start()
 install_vllm_runtime()
-
-gpu_check = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
-print("GPU detected:", gpu_check.stdout.strip(), flush=True)
+subprocess.run(
+    [
+        VLLM_PYTHON, "-c",
+        (
+            "import torch, transformers, vllm; "
+            "assert torch.cuda.is_available(), 'CUDA unavailable in vLLM runtime'; "
+            "p = torch.cuda.get_device_properties(0); "
+            "gib = p.total_memory / 1024**3; "
+            "print(f'Verified runtime: vllm={vllm.__version__}, torch={torch.__version__}, "
+            "transformers={transformers.__version__}, GPU={p.name}, VRAM={gib:.1f} GiB', flush=True); "
+            "assert gib >= 45.0, ("
+            "f'Assigned GPU {p.name!r} has only {gib:.1f} GiB VRAM; 28 GB Qwen3.8-27B-FP8 requires "
+            "RTX Pro 6000 (96 GB). Please select Accelerator -> GPU RTX Pro 6000 in Kaggle Notebook Settings.')"
+        ),
+    ],
+    env=vllm_env(),
+    check=True,
+)
 
 
 def _request_json(url: str, payload: dict | None = None, timeout: int = 30) -> dict:
@@ -289,7 +372,7 @@ def try_launch_tier(tier_name: str, use_lora: bool, use_mtp: bool, timeout_s: in
     served_name = "arc-grpo38" if use_lora else "Qwen/Qwen3.8-27B-FP8"
     log_path = WORKING_DIR / f"vllm_{tier_name}.log"
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        VLLM_PYTHON, "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(MODEL_DIR),
         "--served-model-name", "Qwen/Qwen3.8-27B-FP8",
         "--host", SERVED_MODEL_HOST,
@@ -599,13 +682,13 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     nb = {
         "cells": [
-            md_cell(CELL_0_MD),
-            code_cell(CELL_1_SETUP),
-            code_cell(CELL_2_PRECACHE_AND_ARC),
-            code_cell(CELL_3_VLLM_LAUNCH),
-            code_cell(CELL_4_HARNESS_ENV),
-            code_cell(CELL_5_RUN),
-            code_cell(CELL_6_DIAG),
+            md_cell(CELL_0_MD, "cell-0-intro"),
+            code_cell(CELL_1_SETUP, "cell-1-setup"),
+            code_cell(CELL_2_PRECACHE_AND_ARC, "cell-2-precache"),
+            code_cell(CELL_3_VLLM_LAUNCH, "cell-3-vllm"),
+            code_cell(CELL_4_HARNESS_ENV, "cell-4-harness"),
+            code_cell(CELL_5_RUN, "cell-5-run"),
+            code_cell(CELL_6_DIAG, "cell-6-diag"),
         ],
         "metadata": {
             "kernelspec": {
@@ -619,6 +702,7 @@ def main() -> None:
             },
             "kaggle": {
                 "accelerator": "nvidiaRtxPro6000",
+                "dockerImageVersionId": 31401,
                 "isInternetEnabled": False,
                 "language": "python",
                 "sourceType": "notebook",
@@ -633,6 +717,7 @@ def main() -> None:
 
     meta = {
         "id": "johnnyhyland/arc3-qwen38-27b-grpo-mtp",
+        "id_no": 141783564,
         "title": "ARC3 Qwen38 27B GRPO MTP",
         "code_file": "arc3-qwen38-27b-grpo-mtp.ipynb",
         "language": "python",
