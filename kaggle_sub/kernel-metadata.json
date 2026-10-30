@@ -1,0 +1,27 @@
+{
+  "id": "johnnyhyland/arc3-qwen38-27b-grpo-mtp",
+  "title": "ARC3 Qwen38 27B GRPO MTP",
+  "code_file": "arc3-qwen38-27b-grpo-mtp.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "dfranzen/taaf-kaggle-source-bundle-copy",
+    "driessmit1/arc3-vllm-h100-wheelhouse-v3",
+    "keithtyser/taaf-duck-qwen38-serving-v1",
+    "johnnyhyland/arc3-qwen38-27b-grpo-lora"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "arc-prize-2026-arc-agi-3"
+  ],
+  "model_sources": [
+    "foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1"
+  ]
+}

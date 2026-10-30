@@ -101,9 +101,10 @@ def harness_env(cfg: HarnessConfig, base_url: str, model_name: str) -> dict[str,
             "ARC3_PREFER_TOOL_CALLS": "1" if cfg.prefer_tool_calls else "0",
             # text-only during RL (multimodal optional for inference/eval)
             "MULTIMODAL_CONTEXT": "current_grid" if cfg.multimodal else "",
+            "MULTIMODAL_UPSCALE": "10",
             "ARC3_DIFF_IMAGE": "1" if cfg.multimodal else "0",
-            "ARC3_GAMEOVER_DIFF_IMAGE": "0",
-            "ARC3_ANIMATION": "0",
+            "ARC3_GAMEOVER_DIFF_IMAGE": "1" if cfg.multimodal else "0",
+            "ARC3_ANIMATION": "1" if cfg.multimodal else "0",
             # guards
             "ARC3_GUARDS_FROM_LEVEL": "2",
             "ARC3_BATCH_NOOP_BLOCK": "1",
