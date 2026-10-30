@@ -137,18 +137,22 @@ async def amain(args) -> None:
         max_runtime_s=args.max_runtime_s,
         max_actions=args.max_actions,
         max_gen_tokens=args.max_gen_tokens,
+        prefer_tool_calls=args.prefer_tool_calls,
     )
     tok, template = load_tokenizer_and_template(args.tokenizer)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     games = HOLDOUT_GAMES if args.games == "holdout" else TRAIN_GAMES if args.games == "train" else args.games.split(",")
+    ct_kwargs: dict = {"enable_thinking": True, "preserve_thinking": True}
+    if args.reasoning_effort:
+        ct_kwargs["reasoning_effort"] = args.reasoning_effort
 
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=256)) as session:
         gen = make_mock_generate(tok) if args.mock else make_vllm_generate(session, args.vllm, cfg)
         proxy = HarnessProxy(
             tokenizer=tok,
             chat_template=template,
-            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+            chat_template_kwargs=ct_kwargs,
             generate_fn=gen,
             max_tokens_cap=args.max_output,
             max_model_len=args.max_model_len,
@@ -208,6 +212,8 @@ def main() -> None:
     ap.add_argument("--max-runtime-s", type=float, default=900.0)
     ap.add_argument("--max-actions", type=int, default=0)
     ap.add_argument("--max-gen-tokens", type=int, default=0)
+    ap.add_argument("--reasoning-effort", default="", help="Optional Qwen3.8 reasoning_effort (low/medium/xhigh)")
+    ap.add_argument("--prefer-tool-calls", action="store_true", help="Enable ARC3_PREFER_TOOL_CALLS=1 in harness")
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--out", required=True)
     asyncio.run(amain(ap.parse_args()))

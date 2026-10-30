@@ -1,23 +1,79 @@
 """AsyncGRPO (TRL main @ e29597a, includes huggingface/trl#7760 score centering) LoRA fine-tuning of a
-small Qwen3.5 model *inside the Duck harness* on offline ARC-AGI-3 games, on ONE GPU.
+Qwen3.5 / Qwen3.8 model *inside the Duck harness* on offline ARC-AGI-3 games, on ONE GPU.
 
 Single-GPU layout: the vLLM server and this trainer share the GPU. LoRA adapters are synced to vLLM
 over the filesystem (`--enable-lora` + VLLM_ALLOW_RUNTIME_LORA_UPDATING), so no NCCL group is needed.
-Only the top `--train-layers` decoder layers get LoRA; the rest of the network is frozen, so the
-backward pass stops early (faster steps, far less activation memory).
+Only the top `--train-layers` decoder layers get LoRA; the rest of the network is frozen and runs
+forward-only under `torch.no_grad()` without gradient checkpointing (faster steps, far less activation memory).
 
-    python -m arc_rl.train_grpo --model Qwen/Qwen3.5-9B --vllm http://127.0.0.1:8000 --out runs/grpo1
+    python -m arc_rl.train_grpo --model Qwen/Qwen3.8-27B-FP8 --fp8-base --vllm http://127.0.0.1:8000 --out runs/grpo38
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import random
 from pathlib import Path
 
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def _get_decoder_layers(model):
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    inner = getattr(base, "model", base)
+    lm = getattr(inner, "language_model", inner)
+    return getattr(lm, "layers", None)
+
+
+def _freeze_bottom_layers(model, first_trainable: int) -> None:
+    """Keep frozen bottom layers truly forward-only even after HF Trainer.train() calls gradient_checkpointing_enable().
+
+    HF `Trainer.train()` calls `self.model.gradient_checkpointing_enable()`, which sets `gradient_checkpointing=True`
+    on every decoder layer and calls `enable_input_require_grads()` on `embed_tokens` -- dragging autograd and saved
+    activations through all frozen layers. With `use_reentrant=False`, non-reentrant checkpointing on the top LoRA
+    layers produces bit-exact LoRA gradients even when their input `hidden_states` has `requires_grad=False`.
+    """
+    import torch  # noqa: PLC0415
+
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    for obj in (model, base, getattr(base, "model", None), getattr(getattr(base, "model", None), "language_model", None)):
+        if obj is not None and hasattr(obj, "disable_input_require_grads"):
+            obj.disable_input_require_grads()
+
+    inner = getattr(base, "model", None)
+    if inner is not None and getattr(inner, "visual", None) is not None:
+        inner.visual.to("cpu")
+
+    layers = _get_decoder_layers(model)
+    if layers is None:
+        return
+    n_frozen_gc_off = 0
+    n_train_gc_on = 0
+    for idx, layer in enumerate(layers):
+        if idx < first_trainable:
+            layer.gradient_checkpointing = False
+            n_frozen_gc_off += 1
+            if not getattr(layer, "_arc_no_grad_wrapped", False):
+                orig_forward = layer.forward
+
+                @functools.wraps(orig_forward)
+                def _no_grad_fwd(*a, _fn=orig_forward, **kw):
+                    with torch.no_grad():
+                        return _fn(*a, **kw)
+
+                layer.forward = _no_grad_fwd
+                layer._arc_no_grad_wrapped = True
+        else:
+            n_train_gc_on += int(bool(getattr(layer, "gradient_checkpointing", False)))
+    print(
+        f"freeze check: frozen layers 0..{first_trainable - 1} no_grad=True gc_off={n_frozen_gc_off}; "
+        f"trainable layers {first_trainable}..{len(layers) - 1} gc_on={n_train_gc_on}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -44,6 +100,8 @@ def main() -> None:
     ap.add_argument("--max-output", type=int, default=6 * 1024)
     ap.add_argument("--rollout-runtime-s", type=float, default=480.0)
     ap.add_argument("--rollout-max-actions", type=int, default=0)
+    ap.add_argument("--reasoning-effort", default="", help="Optional Qwen3.8 reasoning_effort (low/medium/xhigh)")
+    ap.add_argument("--prefer-tool-calls", action="store_true", help="Enable ARC3_PREFER_TOOL_CALLS=1 in harness")
     ap.add_argument("--save-steps", type=int, default=5)
     ap.add_argument("--reward-weights", default="{}")
     ap.add_argument("--seed", type=int, default=0)
@@ -52,7 +110,7 @@ def main() -> None:
     import torch
     from datasets import Dataset
     from peft import LoraConfig
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer, TrainerCallback
 
     from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
     from trl.experimental.async_grpo import packing as trl_packing
@@ -94,11 +152,13 @@ def main() -> None:
     cfg = AutoConfig.from_pretrained(args.model)
     n_layers = getattr(getattr(cfg, "text_config", cfg), "num_hidden_layers")
     layers = list(range(n_layers - args.train_layers, n_layers))
+    first_trainable = layers[0]
     model_arg = args.model
     if args.fp8_base:
         from arc_rl.fp8_base import load_fp8_base_with_bf16_top
 
         model_arg, layers = load_fp8_base_with_bf16_top(args.model, args.train_layers)
+        first_trainable = layers[0]
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=2 * args.lora_r,
@@ -109,6 +169,10 @@ def main() -> None:
         layers_pattern="layers",
         task_type="CAUSAL_LM",
     )
+
+    ct_kwargs: dict = {"enable_thinking": True, "preserve_thinking": True}
+    if args.reasoning_effort:
+        ct_kwargs["reasoning_effort"] = args.reasoning_effort
 
     config = AsyncGRPOConfig(
         output_dir=str(out),
@@ -127,7 +191,7 @@ def main() -> None:
         temperature=0.7,
         top_p=0.95,
         top_k=20,
-        chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+        chat_template_kwargs=ct_kwargs,
         vllm_server_base_url=args.vllm,
         request_timeout=1800,
         # huggingface/trl#7760: score-centred objective with masked importance sampling against the vLLM sampler.
@@ -155,6 +219,7 @@ def main() -> None:
         max_output=args.max_output,
         max_runtime_s=args.rollout_runtime_s,
         max_actions=args.rollout_max_actions,
+        prefer_tool_calls=args.prefer_tool_calls,
     )
     eos_ids = sorted({tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")} - {None})
     worker = ArcHarnessRolloutWorker(
@@ -193,14 +258,14 @@ def main() -> None:
         peft_config=peft_config,
         rollout_worker=worker,
     )
+
+    class _FreezeBottomCallback(TrainerCallback):
+        def on_train_begin(self, args, state, control, model=None, **kwargs):
+            _freeze_bottom_layers(model or trainer.model, first_trainable)
+
+    trainer.add_callback(_FreezeBottomCallback())
     model = trainer.model
-    # Make the frozen lower layers actually free. With PEFT + gradient checkpointing TRL calls
-    # `enable_input_require_grads()`, which marks the embedding output as requiring grad so reentrant checkpointing
-    # can reach the adapters -- but that also drags autograd (saved activations + backward) through every frozen
-    # layer. Non-reentrant checkpointing doesn't need it, so drop the hook: autograd now starts at the first LoRA
-    # layer, and layers below it run forward-only.
-    if hasattr(model, "disable_input_require_grads"):
-        model.disable_input_require_grads()
+    _freeze_bottom_layers(model, first_trainable)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"trainable params {n_train / 1e6:.1f}M / {n_all / 1e9:.2f}B; LoRA layers {layers[0]}..{layers[-1]}", flush=True)

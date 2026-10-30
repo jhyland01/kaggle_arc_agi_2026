@@ -1,6 +1,6 @@
 """Runs INSIDE the Colab kernel as one blocking cell, so the VM never looks idle and is not reclaimed.
 
-Stages (each skipped if already done): setup -> vLLM server -> smoke eval -> baseline eval (held-out games).
+Stages (each skipped if already done): setup -> vLLM server -> smoke eval -> requested stage(s).
 Progress goes to /content/driver.log; pull it with `colab download`.
 
     python colab/driver.py baseline
@@ -56,8 +56,8 @@ def stop_vllm() -> None:
 
 
 def unload_stale_adapters() -> None:
-    """A previous (killed) training run leaves `trl-policy-vN` adapters registered in vLLM; a new run re-publishing
-    `trl-policy-v1` would then be rejected. Unload them before training."""
+    """A previous training run leaves `trl-policy-vN` adapters registered in vLLM; a new run re-publishing
+    `trl-policy-v1` would then be rejected. Unload them before training or clean baseline eval."""
     import json
     import urllib.request
 
@@ -73,6 +73,22 @@ def unload_stale_adapters() -> None:
             log(f"unloaded stale adapter {m['id']}")
 
 
+def run_confirm(eval_cmd: str, model: str, eval_runtime: str) -> None:
+    adapter = os.environ.get("ADAPTER", "/content/adapters/arc-grpo1")
+    name = os.environ.get("ADAPTER_NAME", "arc-grpo1")
+    passes = os.environ.get("PASSES", "2")
+    conc = os.environ.get("CONFIRM_CONCURRENCY", "10")
+    base_out = os.environ.get("CONFIRM_BASE_OUT", f"/content/runs/confirm_base_{name}")
+    adap_out = os.environ.get("CONFIRM_ADAP_OUT", f"/content/runs/confirm_{name}")
+    sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
+       f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/confirm.log", check=False)
+    common = f"--games holdout --passes {passes} --concurrency {conc} --max-runtime-s {eval_runtime}"
+    sh(f"bash -c '{eval_cmd} --model {model} {common} --out {base_out} > /content/confirm_base.log 2>&1 & p1=$!; "
+       f"{eval_cmd} --model {name} {common} --out {adap_out} > /content/confirm_adapter.log 2>&1 & p2=$!; "
+       f"wait $p1 && wait $p2'",
+       "/content/confirm.log")
+
+
 def main() -> None:
     stage = sys.argv[1] if len(sys.argv) > 1 else "baseline"
     if stage == "trainsmoke":
@@ -81,6 +97,11 @@ def main() -> None:
         stage = "train_only"
     t0 = time.time()
     model = os.environ.setdefault("MODEL", "Qwen/Qwen3.5-9B")  # also read by setup.sh / launch_vllm.sh
+    eval_conc = os.environ.get("EVAL_CONCURRENCY", "20")
+    eval_passes = os.environ.get("EVAL_PASSES", "2")
+    eval_runtime = os.environ.get("EVAL_RUNTIME_S", "600")
+    eval_extra = os.environ.get("EVAL_EXTRA", "").strip()
+
     log(f"driver start, stage={stage}, model={model}")
     if not Path("/content/setup.done").exists():
         sh("bash /content/arc/colab/setup.sh", "/content/setup.log")
@@ -93,40 +114,53 @@ def main() -> None:
         sh("bash /content/arc/colab/launch_vllm.sh", "/content/vllm_launch.log")
     log("vLLM is up")
     eval_cmd = (f"PYTHONPATH=/content/arc python -m arc_rl.eval_games --bundle work_bundle "
-                f"--env-dir data/environment_files --tokenizer {model}")
+                f"--env-dir data/environment_files --tokenizer {model}"
+                + (f" {eval_extra}" if eval_extra else ""))
     smoke_flag = Path(f"/content/smoke_{model.replace('/', '_')}.done")
     if not smoke_flag.exists():
         sh(f"{eval_cmd} --model {model} --games ft09 --passes 1 --concurrency 1 --max-runtime-s 180 --max-actions 10 "
            f"--out /content/runs/smoke_{model.replace('/', '_')}", "/content/smoke.log")
         smoke_flag.write_text("ok")
-    if stage == "confirm":
-        # Baseline and adapter evaluated simultaneously (10 concurrent games each), so both see the same GPU load.
-        adapter = os.environ.get("ADAPTER", "/content/adapters/arc-grpo1")
-        name = os.environ.get("ADAPTER_NAME", "arc-grpo1")
-        passes = os.environ.get("PASSES", "4")
-        sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
-           f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/confirm.log", check=False)
-        common = f"--games holdout --passes {passes} --concurrency 10 --max-runtime-s 600"
-        sh(f"( {eval_cmd} --model {model} {common} --out /content/runs/confirm_base > /content/confirm_base.log 2>&1 & "
-           f"{eval_cmd} --model {name} {common} --out /content/runs/confirm_{name} > /content/confirm_adapter.log 2>&1 & wait )",
-           "/content/confirm.log")
-    if stage in ("baseline", "all"):
-        out = os.environ.get("BASELINE_OUT", "/content/runs/baseline_holdout")
-        sh(f"{eval_cmd} --model {model} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
-           f"--out {out}", "/content/baseline.log")
-    if stage in ("train", "train_only", "all"):
+
+    if stage == "smoke_and_base":
+        unload_stale_adapters()
+        smoke_out = os.environ.get("SMOKE_TRAIN_OUT", "/content/runs/grpo38_smoke")
+        smoke_args = os.environ["SMOKE_TRAIN_ARGS"]
+        sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model {model} --vllm http://127.0.0.1:8000 "
+           f"--bundle work_bundle --env-dir data/environment_files --out {smoke_out} {smoke_args}",
+           "/content/trainsmoke.log")
+        unload_stale_adapters()
+        out = os.environ.get("BASELINE_OUT", "/content/runs/baseline38_holdout")
+        sh(f"{eval_cmd} --model {model} --games holdout --passes {eval_passes} --concurrency {eval_conc} "
+           f"--max-runtime-s {eval_runtime} --out {out}", "/content/baseline.log")
+    elif stage == "train_and_confirm":
         unload_stale_adapters()
         extra = os.environ.get("TRAIN_ARGS", "")
         sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model {model} --vllm http://127.0.0.1:8000 "
-           f"--bundle work_bundle --env-dir data/environment_files --out {os.environ.get('TRAIN_OUT', '/content/runs/grpo1')} {extra}",
+           f"--bundle work_bundle --env-dir data/environment_files --out {os.environ.get('TRAIN_OUT', '/content/runs/grpo38')} {extra}",
            "/content/train.log")
-    if stage in ("posteval", "train", "all"):
-        adapter = os.environ.get("ADAPTER", "/content/runs/grpo1/final_adapter")
-        name = os.environ.get("ADAPTER_NAME", "arc-grpo1")
-        sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
-           f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/posteval.log", check=False)
-        sh(f"{eval_cmd} --model {name} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
-           f"--out /content/runs/post_{name}", "/content/posteval.log")
+        unload_stale_adapters()
+        run_confirm(eval_cmd, model, eval_runtime)
+    else:
+        if stage == "confirm":
+            run_confirm(eval_cmd, model, eval_runtime)
+        if stage in ("baseline", "all"):
+            out = os.environ.get("BASELINE_OUT", "/content/runs/baseline_holdout")
+            sh(f"{eval_cmd} --model {model} --games holdout --passes {eval_passes} --concurrency {eval_conc} "
+               f"--max-runtime-s {eval_runtime} --out {out}", "/content/baseline.log")
+        if stage in ("train", "train_only", "all"):
+            unload_stale_adapters()
+            extra = os.environ.get("TRAIN_ARGS", "")
+            sh(f"PYTHONPATH=/content/arc python -m arc_rl.train_grpo --model {model} --vllm http://127.0.0.1:8000 "
+               f"--bundle work_bundle --env-dir data/environment_files --out {os.environ.get('TRAIN_OUT', '/content/runs/grpo1')} {extra}",
+               "/content/train.log")
+        if stage in ("posteval", "train", "all"):
+            adapter = os.environ.get("ADAPTER", "/content/runs/grpo1/final_adapter")
+            name = os.environ.get("ADAPTER_NAME", "arc-grpo1")
+            sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
+               f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/posteval.log", check=False)
+            sh(f"{eval_cmd} --model {name} --games holdout --passes {eval_passes} --concurrency {eval_conc} "
+               f"--max-runtime-s {eval_runtime} --out /content/runs/post_{name}", "/content/posteval.log")
     log(f"driver done in {time.time() - t0:.0f}s")
 
 

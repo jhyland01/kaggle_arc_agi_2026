@@ -35,6 +35,8 @@ class HarnessConfig:
     max_runtime_s: float = 900.0
     max_actions: int = 0
     max_gen_tokens: int = 0
+    prefer_tool_calls: bool = False
+    multimodal: bool = False
     python_bin: str = sys.executable
 
     def to_dict(self) -> dict:
@@ -96,9 +98,10 @@ def harness_env(cfg: HarnessConfig, base_url: str, model_name: str) -> dict[str,
             "ARC3_ACTION_INFO": "1",
             "ARC3_DEDUPE_MULTICALL_LINE": "1",
             "ARC3_FRAME_DIFF_HINT": "1",
-            # text-only
-            "MULTIMODAL_CONTEXT": "",
-            "ARC3_DIFF_IMAGE": "0",
+            "ARC3_PREFER_TOOL_CALLS": "1" if cfg.prefer_tool_calls else "0",
+            # text-only during RL (multimodal optional for inference/eval)
+            "MULTIMODAL_CONTEXT": "current_grid" if cfg.multimodal else "",
+            "ARC3_DIFF_IMAGE": "1" if cfg.multimodal else "0",
             "ARC3_GAMEOVER_DIFF_IMAGE": "0",
             "ARC3_ANIMATION": "0",
             # guards
