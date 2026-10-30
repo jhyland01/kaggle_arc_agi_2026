@@ -256,7 +256,8 @@ for entry in source_entries:
     sys.path.insert(0, str(entry))
 pth_path = Path(sysconfig.get_paths()["purelib"]) / "taaf_kaggle_sources.pth"
 pth_path.write_text("".join(f"{entry}\\n" for entry in source_entries))
-print(f"Configured {len(source_entries)} TAAF source entries -> {pth_path}")
+import taaf.game_api, inference.agent.tool_agent  # verify patched harness imports cleanly on kernel Python
+print(f"Configured {len(source_entries)} TAAF source entries -> {pth_path} (taaf + patched tool_agent verified)")
 """
 
 CELL_3_VLLM_LAUNCH = """# Offline vLLM installation + Multi-Tier RTX PRO 6000 Server Launch (MTP3 + LoRA -> LoRA -> Base+MTP3)
@@ -342,22 +343,39 @@ def install_vllm_runtime() -> None:
 precache_model_thread = threading.Thread(target=precache, args=(MODEL_DIR,), kwargs={"delay": 5, "threads": 4}, daemon=True)
 precache_model_thread.start()
 install_vllm_runtime()
+help_out = subprocess.check_output(
+    [VLLM_PYTHON, "-m", "vllm.entrypoints.openai.api_server", "--help"],
+    env=vllm_env(),
+    text=True,
+)
+for req_flag in ("--speculative-config", "--enable-lora", "--default-chat-template-kwargs", "--tool-call-parser", "--reasoning-parser"):
+    assert req_flag in help_out, f"Missing required vLLM CLI flag {req_flag} in api_server --help"
 subprocess.run(
     [
         VLLM_PYTHON, "-c",
         (
-            "import torch, transformers, vllm, xgrammar; "
-            "from vllm.entrypoints.openai import api_server; "
+            "import importlib.metadata as im, sys, safetensors.torch as st, torch, transformers, vllm, xgrammar; "
+            "from transformers import AutoConfig, AutoTokenizer; "
+            "model_dir, lora_file = sys.argv[1], sys.argv[2]; "
+            "cfg = AutoConfig.from_pretrained(model_dir); "
+            "tok = AutoTokenizer.from_pretrained(model_dir); "
+            "rendered = tok.apply_chat_template([{'role': 'user', 'content': 'ok'}], tokenize=False, "
+            "add_generation_prompt=True, preserve_thinking=True, reasoning_effort='medium'); "
+            "lora_sd = st.load_file(lora_file); "
+            "assert len(lora_sd) == 84, f'Expected 84 LoRA tensors, got {len(lora_sd)}'; "
             "assert torch.cuda.is_available(), 'CUDA unavailable in vLLM runtime'; "
             "p = torch.cuda.get_device_properties(0); "
             "gib = p.total_memory / 1024**3; "
             "print(f'Verified runtime: vllm={vllm.__version__}, torch={torch.__version__}, "
-            "transformers={transformers.__version__}, xgrammar={xgrammar.__version__}, "
+            "transformers={transformers.__version__}, xgrammar={im.version('xgrammar')}, "
+            "qwen_arch={cfg.architectures}, lora_tensors={len(lora_sd)}, chat_tmpl_len={len(rendered)}, "
             "GPU={p.name} x{torch.cuda.device_count()}, VRAM_per_gpu={gib:.1f} GiB', flush=True); "
             "assert gib >= 45.0, ("
             "f'Assigned GPU {p.name!r} has only {gib:.1f} GiB VRAM per GPU; 28 GB Qwen3.8-27B-FP8 requires "
             "RTX Pro 6000 (96 GB). Please select Accelerator -> GPU RTX Pro 6000 in Kaggle Notebook Settings.')"
         ),
+        str(MODEL_DIR),
+        str(LORA_ADAPTER_DIR / "adapter_model.safetensors"),
     ],
     env=vllm_env(),
     check=True,
