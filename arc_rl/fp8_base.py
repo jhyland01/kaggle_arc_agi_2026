@@ -57,9 +57,23 @@ def load_fp8_base_with_bf16_top(model_id: str, top_layers: int, device: str = "c
     from transformers.integrations.finegrained_fp8 import FP8Linear  # noqa: PLC0415
 
     cfg = AutoConfig.from_pretrained(model_id)
+    # Qwen3.8-27B-FP8 includes MoE router names `*.mlp.gate` in `modules_to_not_convert`. In transformers 5.19
+    # `should_convert_module` uses substring matching, so `*.mlp.gate` falsely matches dense `*.mlp.gate_proj`,
+    # leaving 64 gate_proj weights unscaled in bf16 (+5.7 GiB VRAM and wrong logits). Keep only real module names.
+    qcfg = getattr(cfg, "quantization_config", None)
+    mods = qcfg.get("modules_to_not_convert") if isinstance(qcfg, dict) else getattr(qcfg, "modules_to_not_convert", None)
+    if mods:
+        with torch.device("meta"):
+            real_names = {n for n, _ in AutoModelForImageTextToText.from_config(cfg).named_modules()}
+        clean_mods = [nc for nc in mods if nc in real_names or "visual." in nc]
+        if isinstance(qcfg, dict):
+            qcfg["modules_to_not_convert"] = clean_mods
+        else:
+            qcfg.modules_to_not_convert = clean_mods
+
     n_layers = cfg.get_text_config().num_hidden_layers
     first = n_layers - top_layers
-    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.bfloat16, device_map=device)
+    model = AutoModelForImageTextToText.from_pretrained(model_id, config=cfg, dtype=torch.bfloat16, device_map=device)
 
     # AsyncGRPO runs text-only; keep the unquantized bf16 vision tower (~1.3 GiB) on CPU.
     inner = getattr(model, "model", None)

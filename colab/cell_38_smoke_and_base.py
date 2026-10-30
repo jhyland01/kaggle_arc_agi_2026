@@ -1,7 +1,11 @@
-# Colab kernel cell 1: setup + vLLM Qwen/Qwen3.8-27B-FP8 + 2-step AsyncGRPO (#7760) smoke test + 1-pass holdout baseline.
+# Colab kernel cell 1: unpack project + setup + vLLM Qwen/Qwen3.8-27B-FP8 + 2-step AsyncGRPO (#7760) smoke test + 1-pass holdout baseline.
 import os
 import runpy
+import subprocess
 import sys
+
+if not os.path.exists("/content/arc/colab/driver.py"):
+    subprocess.run("mkdir -p /content/arc && tar -xzf /content/arc.tar.gz -C /content/arc", shell=True, check=True)
 
 COMMON_MODEL_ARGS = (
     "--max-model-len 32768 --context-window 26624 --max-output 4096 "
