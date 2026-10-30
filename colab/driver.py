@@ -72,6 +72,17 @@ def main() -> None:
         sh(f"{eval_cmd} --games ft09 --passes 1 --concurrency 1 --max-runtime-s 180 --max-actions 10 "
            f"--out /content/runs/smoke", "/content/smoke.log")
         Path("/content/smoke.done").write_text("ok")
+    if stage == "confirm":
+        # Baseline and adapter evaluated simultaneously (10 concurrent games each), so both see the same GPU load.
+        adapter = os.environ.get("ADAPTER", "/content/adapters/arc-grpo1")
+        name = os.environ.get("ADAPTER_NAME", "arc-grpo1")
+        passes = os.environ.get("PASSES", "4")
+        sh(f"curl -sf -X POST http://127.0.0.1:8000/v1/load_lora_adapter -H 'Content-Type: application/json' "
+           f"-d '{{\"lora_name\": \"{name}\", \"lora_path\": \"{adapter}\"}}'", "/content/confirm.log", check=False)
+        common = f"--games holdout --passes {passes} --concurrency 10 --max-runtime-s 600"
+        sh(f"( {eval_cmd} --model Qwen/Qwen3.5-9B {common} --out /content/runs/confirm_base > /content/confirm_base.log 2>&1 & "
+           f"{eval_cmd} --model {name} {common} --out /content/runs/confirm_{name} > /content/confirm_adapter.log 2>&1 & wait )",
+           "/content/confirm.log")
     if stage in ("baseline", "all"):
         sh(f"{eval_cmd} --games holdout --passes 2 --concurrency 20 --max-runtime-s 600 "
            f"--out /content/runs/baseline_holdout", "/content/baseline.log")
