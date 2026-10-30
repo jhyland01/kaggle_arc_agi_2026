@@ -172,7 +172,28 @@ clean_patch = PATCH_PATH.read_bytes().replace(b"\\r\\n", b"\\n").rstrip(b"\\n") 
 TMP_PATCH = Path("/tmp/harness-changes-clean.patch")
 TMP_PATCH.write_bytes(clean_patch)
 subprocess.run(["git", "apply", "--include=ARC3-Inference/*", "-v", str(TMP_PATCH)], cwd=str(BUNDLE_DIR / "src"), check=True)
-print("Harness patch applied cleanly.")
+
+# Ensure request-level chat_template_kwargs carries ARC3_DEFAULT_REASONING_EFFORT (vLLM replaces server default when dict is non-empty)
+ta_file = BUNDLE_DIR / "src/ARC3-Inference/inference/agent/tool_agent.py"
+ta_src = ta_file.read_text()
+_effort_target = (
+    '        preserve_thinking = _preserve_thinking_kwarg()\\n'
+    '        if preserve_thinking is not None:\\n'
+    '            kwargs["preserve_thinking"] = preserve_thinking\\n'
+    '        ladder = _reasoning_effort_ladder()'
+)
+_effort_repl = (
+    '        preserve_thinking = _preserve_thinking_kwarg()\\n'
+    '        if preserve_thinking is not None:\\n'
+    '            kwargs["preserve_thinking"] = preserve_thinking\\n'
+    '        default_effort = os.environ.get("ARC3_DEFAULT_REASONING_EFFORT", "").strip()\\n'
+    '        if default_effort:\\n'
+    '            kwargs["reasoning_effort"] = default_effort\\n'
+    '        ladder = _reasoning_effort_ladder()'
+)
+assert ta_src.count(_effort_target) == 1, "Expected exact _harness_template_kwargs block in patched tool_agent.py"
+ta_file.write_text(ta_src.replace(_effort_target, _effort_repl, 1))
+print("Harness patch + default reasoning_effort hook applied cleanly.")
 """
 
 CELL_2_PRECACHE_AND_ARC = """# Background disk precache for wheelhouse + model shards while pip installs
@@ -256,8 +277,10 @@ for entry in source_entries:
     sys.path.insert(0, str(entry))
 pth_path = Path(sysconfig.get_paths()["purelib"]) / "taaf_kaggle_sources.pth"
 pth_path.write_text("".join(f"{entry}\\n" for entry in source_entries))
-import taaf.game_api, inference.agent.tool_agent  # verify patched harness imports cleanly on kernel Python
-print(f"Configured {len(source_entries)} TAAF source entries -> {pth_path} (taaf + patched tool_agent verified)")
+# IMPORTANT: Verify imports in a CHILD subprocess so inference.agent.tool_agent and inference.framework.solver
+# are NOT imported in this kernel process before CELL_4_HARNESS_ENV sets os.environ!
+subprocess.run([sys.executable, "-c", "import taaf.game_api, inference.agent.tool_agent, inference.framework.solver"], check=True)
+print(f"Configured {len(source_entries)} TAAF source entries -> {pth_path} (child-process import verified)")
 """
 
 CELL_3_VLLM_LAUNCH = """# Offline vLLM installation + Multi-Tier RTX PRO 6000 Server Launch (MTP3 + LoRA -> LoRA -> Base+MTP3)
@@ -507,9 +530,11 @@ setup_env = {
     "LOCAL_ANALYZER_TOP_P": "0.95",
     "LOCAL_ANALYZER_TOP_K": "20",
 
-    # Context pruning
+    # Context pruning & reasoning effort control
     "LOCAL_ANALYZER_CONTEXT_WINDOW": str(112 * 1024),
-    "LOCAL_ANALYZER_MAX_OUTPUT": str(10 * 1024),
+    "LOCAL_ANALYZER_MAX_OUTPUT": str(8 * 1024),
+    "ARC3_DEFAULT_REASONING_EFFORT": "medium",
+    "ARC3_REASONING_EFFORT_LADDER": "low",
     "ARC3_CONTEXT_DRAIN_TOKENS": str(54 * 1024),
     "ARC3_HISTORY_ASSISTANT_TURNS": "150",
     "ARC3_HISTORY_TURN_DRAIN": "30",
@@ -558,6 +583,8 @@ if USE_PRIORITY_SCHEDULING:
         "ARC3_PRIORITY_SCORE_NORMALIZATION": "1",
     })
 
+assert "inference.agent.tool_agent" not in sys.modules, "tool_agent imported before setup_env!"
+assert "inference.framework.solver" not in sys.modules, "solver imported before setup_env!"
 os.environ.update({k: str(v) for k, v in setup_env.items()})
 
 with open(BUNDLE_DIR / "deploy_target.pkl", "rb") as f:
@@ -568,6 +595,26 @@ target.is_competition_rerun = TRUE_SUBMISSION
 with open(BUNDLE_DIR / "benchmark_initial.pkl", "rb") as f:
     bm = pickle.load(f)
 bm.job_dir = WORKING_DIR
+
+import inference.agent.tool_agent as _ta
+import inference.framework.solver as _sv
+assert _ta._LOCAL_ANALYZER_CONTEXT_WINDOW == 112 * 1024, _ta._LOCAL_ANALYZER_CONTEXT_WINDOW
+assert _ta._LOCAL_ANALYZER_MAX_OUTPUT == 8 * 1024, _ta._LOCAL_ANALYZER_MAX_OUTPUT
+assert _ta._LOCAL_ANALYZER_YIELD_TOKENS == 2048, _ta._LOCAL_ANALYZER_YIELD_TOKENS
+assert _ta._LOCAL_ANALYZER_TOOL_STEPS == 0, _ta._LOCAL_ANALYZER_TOOL_STEPS
+assert _ta._LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS == 3072, _ta._LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS
+assert _ta._DIFF_IMAGE is True, _ta._DIFF_IMAGE
+assert _sv.ANIMATION_ENABLED is True, _sv.ANIMATION_ENABLED
+assert _sv.ACTION_ECHO is True, _sv.ACTION_ECHO
+assert _sv.GUARDS_FROM_LEVEL == 2, _sv.GUARDS_FROM_LEVEL
+assert _sv.BATCH_NOOP_BLOCK is True, _sv.BATCH_NOOP_BLOCK
+assert _sv.STALE_STATE_BLOCK is True, _sv.STALE_STATE_BLOCK
+print(
+    f"Verified live harness constants: ctx={_ta._LOCAL_ANALYZER_CONTEXT_WINDOW}, "
+    f"max_out={_ta._LOCAL_ANALYZER_MAX_OUTPUT}, yield_tok={_ta._LOCAL_ANALYZER_YIELD_TOKENS}, "
+    f"diff_img={_ta._DIFF_IMAGE}, anim={_sv.ANIMATION_ENABLED}, guards_lvl={_sv.GUARDS_FROM_LEVEL}",
+    flush=True,
+)
 
 bm.solver.max_runtime_s_per_game = 48 * 60
 bm.solver.analyzer_timeout = 900.0
