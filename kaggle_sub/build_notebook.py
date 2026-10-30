@@ -115,19 +115,10 @@ LORA_ADAPTER_DIR = LORA_DATASET_DIR / LORA_VARIANT
 assert (LORA_ADAPTER_DIR / "adapter_model.safetensors").is_file(), f"Missing LoRA weights at {LORA_ADAPTER_DIR}"
 
 
-# Ensure Python 3.12 for cp312 vLLM 0.19 wheelhouse even if Kaggle container runs Python 3.13+
+# Ensure full Python 3.12 (with pip + Python.h + libpython3.12.so) for cp312 vLLM 0.19 wheelhouse
 def _ensure_python312(lora_dataset_dir: Path) -> str:
     if sys.version_info[:2] == (3, 12):
         return sys.executable
-    candidates = [
-        shutil.which("python3.12"),
-        "/usr/bin/python3.12",
-        "/usr/local/bin/python3.12",
-        "/opt/conda/bin/python3.12",
-    ]
-    for c in candidates:
-        if c and Path(c).is_file() and os.access(c, os.X_OK):
-            return str(Path(c).resolve())
     standalone_tar = lora_dataset_dir / "cpython-3.12-linux-x86_64.blob"
     py312_bin = Path("/tmp/py312/python/bin/python3.12")
     if not py312_bin.is_file() and standalone_tar.is_file():
@@ -138,6 +129,10 @@ def _ensure_python312(lora_dataset_dir: Path) -> str:
         py312_bin.chmod(0o755)
     if py312_bin.is_file():
         return str(py312_bin)
+    for c in (shutil.which("python3.12"), "/usr/bin/python3.12", "/usr/local/bin/python3.12", "/opt/conda/bin/python3.12"):
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            if subprocess.call([c, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                return str(Path(c).resolve())
     return sys.executable
 
 
@@ -275,6 +270,12 @@ SERVER_BASE_URL = f"http://{SERVED_MODEL_HOST}:{SERVED_MODEL_PORT}/v1"
 def vllm_env() -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SITE_PACKAGES)
+    py_prefix = Path(VLLM_PYTHON).resolve().parent.parent
+    if (py_prefix / "lib").is_dir():
+        ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{py_prefix / 'lib'}{os.pathsep}{ld}" if ld else str(py_prefix / "lib")
+    if (py_prefix / "bin").is_dir():
+        env["PATH"] = f"{py_prefix / 'bin'}{os.pathsep}{env.get('PATH', '')}"
     env.update({
         "PYTHONNOUSERSITE": "1",
         "USE_TF": "0",
@@ -345,14 +346,16 @@ subprocess.run(
     [
         VLLM_PYTHON, "-c",
         (
-            "import torch, transformers, vllm; "
+            "import torch, transformers, vllm, xgrammar; "
+            "from vllm.entrypoints.openai import api_server; "
             "assert torch.cuda.is_available(), 'CUDA unavailable in vLLM runtime'; "
             "p = torch.cuda.get_device_properties(0); "
             "gib = p.total_memory / 1024**3; "
             "print(f'Verified runtime: vllm={vllm.__version__}, torch={torch.__version__}, "
-            "transformers={transformers.__version__}, GPU={p.name}, VRAM={gib:.1f} GiB', flush=True); "
+            "transformers={transformers.__version__}, xgrammar={xgrammar.__version__}, "
+            "GPU={p.name} x{torch.cuda.device_count()}, VRAM_per_gpu={gib:.1f} GiB', flush=True); "
             "assert gib >= 45.0, ("
-            "f'Assigned GPU {p.name!r} has only {gib:.1f} GiB VRAM; 28 GB Qwen3.8-27B-FP8 requires "
+            "f'Assigned GPU {p.name!r} has only {gib:.1f} GiB VRAM per GPU; 28 GB Qwen3.8-27B-FP8 requires "
             "RTX Pro 6000 (96 GB). Please select Accelerator -> GPU RTX Pro 6000 in Kaggle Notebook Settings.')"
         ),
     ],
