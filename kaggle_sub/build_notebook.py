@@ -88,10 +88,12 @@ gpu_info = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--for
 print(f"GPU check: rc={gpu_info.returncode}, out={gpu_info.stdout.strip()!r}, err={gpu_info.stderr.strip()!r}", flush=True)
 
 # LoRA variant selector:
-#   "final_adapter_blend50" -> lora_alpha=16 (0.5x multimodal-balanced RL policy, recommended with images)
+#   "none"                  -> Unmodified Base Qwen3.8-27B-FP8 + 3-step MTP (ablation baseline, default)
+#   "final_adapter_blend50" -> lora_alpha=16 (0.5x RL policy)
 #   "final_adapter"         -> lora_alpha=32 (1.0x full RL policy)
 #   "checkpoint20_adapter"  -> step-20 checkpoint
-LORA_VARIANT = os.environ.get("ARC3_LORA_VARIANT", "final_adapter_blend50")
+LORA_VARIANT = os.environ.get("ARC3_LORA_VARIANT", "none").strip()
+USE_LORA = LORA_VARIANT.lower() not in {"", "none", "off", "0", "base"}
 
 
 def _find_by_predicate(root: Path, pred, desc: str) -> Path:
@@ -108,11 +110,12 @@ bundle_markers = sorted(INPUT_ROOT.rglob("taaf-kaggle-bundle.json"))
 preferred_bundles = [m.parent for m in bundle_markers if "taaf-kaggle-source-bundle-copy" in str(m)]
 ORIG_BUNDLE_DIR = preferred_bundles[0] if preferred_bundles else bundle_markers[0].parent
 
-# 2. Locate harness-changes.patch and LoRA adapter from johnnyhyland/arc3-qwen38-27b-grpo-lora
+# 2. Locate harness-changes.patch (and optional LoRA adapter) from johnnyhyland/arc3-qwen38-27b-grpo-lora
 PATCH_PATH = _find_by_predicate(INPUT_ROOT, lambda p: p.is_file() and p.name == "harness-changes.patch", "harness-changes.patch")
 LORA_DATASET_DIR = PATCH_PATH.parent
-LORA_ADAPTER_DIR = LORA_DATASET_DIR / LORA_VARIANT
-assert (LORA_ADAPTER_DIR / "adapter_model.safetensors").is_file(), f"Missing LoRA weights at {LORA_ADAPTER_DIR}"
+LORA_ADAPTER_DIR = (LORA_DATASET_DIR / LORA_VARIANT) if USE_LORA else None
+if USE_LORA:
+    assert (LORA_ADAPTER_DIR / "adapter_model.safetensors").is_file(), f"Missing LoRA weights at {LORA_ADAPTER_DIR}"
 
 
 # Ensure full Python 3.12 (with pip + Python.h + libpython3.12.so) for cp312 vLLM 0.19 wheelhouse
@@ -383,22 +386,22 @@ subprocess.run(
             "cfg = AutoConfig.from_pretrained(model_dir); "
             "tok = AutoTokenizer.from_pretrained(model_dir); "
             "rendered = tok.apply_chat_template([{'role': 'user', 'content': 'ok'}], tokenize=False, "
-            "add_generation_prompt=True, preserve_thinking=True, reasoning_effort='medium'); "
-            "lora_sd = st.load_file(lora_file); "
-            "assert len(lora_sd) == 84, f'Expected 84 LoRA tensors, got {len(lora_sd)}'; "
+            "add_generation_prompt=True, preserve_thinking=True); "
+            "n_lora = len(st.load_file(lora_file)) if lora_file else 0; "
+            "assert (not lora_file) or n_lora == 84, f'Expected 84 LoRA tensors, got {n_lora}'; "
             "assert torch.cuda.is_available(), 'CUDA unavailable in vLLM runtime'; "
             "p = torch.cuda.get_device_properties(0); "
             "gib = p.total_memory / 1024**3; "
             "print(f'Verified runtime: vllm={vllm.__version__}, torch={torch.__version__}, "
             "transformers={transformers.__version__}, xgrammar={im.version('xgrammar')}, "
-            "qwen_arch={cfg.architectures}, lora_tensors={len(lora_sd)}, chat_tmpl_len={len(rendered)}, "
+            "qwen_arch={cfg.architectures}, lora_tensors={n_lora}, chat_tmpl_len={len(rendered)}, "
             "GPU={p.name} x{torch.cuda.device_count()}, VRAM_per_gpu={gib:.1f} GiB', flush=True); "
             "assert gib >= 45.0, ("
             "f'Assigned GPU {p.name!r} has only {gib:.1f} GiB VRAM per GPU; 28 GB Qwen3.8-27B-FP8 requires "
             "RTX Pro 6000 (96 GB). Please select Accelerator -> GPU RTX Pro 6000 in Kaggle Notebook Settings.')"
         ),
         str(MODEL_DIR),
-        str(LORA_ADAPTER_DIR / "adapter_model.safetensors"),
+        str(LORA_ADAPTER_DIR / "adapter_model.safetensors") if USE_LORA else "",
     ],
     env=vllm_env(),
     check=True,
@@ -422,7 +425,7 @@ def try_launch_tier(tier_name: str, use_lora: bool, use_mtp: bool, timeout_s: in
         "--host", SERVED_MODEL_HOST,
         "--port", str(SERVED_MODEL_PORT),
         "--tensor-parallel-size", "1",
-        "--max-model-len", str((116 + 12) * 1024),
+        "--max-model-len", str((116 + 12 + 8) * 1024),
         "--gpu-memory-utilization", "0.90",
         "--kv-cache-dtype", "fp8",
         "--enable-prefix-caching",
@@ -431,7 +434,7 @@ def try_launch_tier(tier_name: str, use_lora: bool, use_mtp: bool, timeout_s: in
         "--tool-call-parser", "qwen3_coder",
         "--reasoning-parser", "qwen3",
         "--generation-config", "vllm",
-        "--default-chat-template-kwargs", '{"preserve_thinking": true, "reasoning_effort": "medium"}',
+        "--default-chat-template-kwargs", '{"preserve_thinking": true}',
     ]
     if use_lora:
         cmd += [
@@ -464,6 +467,7 @@ def try_launch_tier(tier_name: str, use_lora: bool, use_mtp: bool, timeout_s: in
                         "messages": [{"role": "user", "content": "Reply with OK."}],
                         "temperature": 0.0,
                         "max_tokens": 32,
+                        "chat_template_kwargs": {"enable_thinking": False},
                     },
                     timeout=120,
                 )
@@ -483,12 +487,12 @@ def try_launch_tier(tier_name: str, use_lora: bool, use_mtp: bool, timeout_s: in
 
 
 vllm_proc, SERVED_MODEL_NAME = None, ""
-for tier_name, use_lora, use_mtp in [
-    ("mtp3_lora", True, True),
-    ("lora_only", True, False),
-    ("mtp3_base", False, True),
-    ("base_only", False, False),
-]:
+TIERS = (
+    [("mtp3_lora", True, True), ("lora_only", True, False), ("mtp3_base", False, True), ("base_only", False, False)]
+    if USE_LORA
+    else [("mtp3_base", False, True), ("base_only", False, False)]
+)
+for tier_name, use_lora, use_mtp in TIERS:
     with socket.socket() as probe:
         if probe.connect_ex((SERVED_MODEL_HOST, SERVED_MODEL_PORT)) == 0:
             time.sleep(3)
@@ -530,12 +534,10 @@ setup_env = {
     "LOCAL_ANALYZER_TOP_P": "0.95",
     "LOCAL_ANALYZER_TOP_K": "20",
 
-    # Context pruning & reasoning effort control
-    "LOCAL_ANALYZER_CONTEXT_WINDOW": str(112 * 1024),
-    "LOCAL_ANALYZER_MAX_OUTPUT": str(8 * 1024),
-    "ARC3_DEFAULT_REASONING_EFFORT": "medium",
-    "ARC3_REASONING_EFFORT_LADDER": "low",
-    "ARC3_CONTEXT_DRAIN_TOKENS": str(54 * 1024),
+    # Context pruning (matched 1:1 with AGI-Boys cell_04.py; full default reasoning effort, no medium/low throttle)
+    "LOCAL_ANALYZER_CONTEXT_WINDOW": str((116 + 12) * 1024),
+    "LOCAL_ANALYZER_MAX_OUTPUT": str(12 * 1024),
+    "ARC3_CONTEXT_DRAIN_TOKENS": str(58 * 1024),
     "ARC3_HISTORY_ASSISTANT_TURNS": "150",
     "ARC3_HISTORY_TURN_DRAIN": "30",
     "ARC3_HISTORY_DRAIN_COALESCE": "1",
@@ -545,14 +547,13 @@ setup_env = {
     "ARC3_MIDDLE_TRUNCATION": "1",
     "ARC3_ACTION_ECHO": "1",
 
-    # Prompt improvements + our RL action-efficiency prompt guidance
+    # Prompt improvements (matched 1:1 with AGI-Boys cell_04.py; no ARC3_PREFER_TOOL_CALLS anti-reasoning throttle)
     "ARC3_EXPLAIN_GAMEPLAY_CHANGED": "1",
     "ARC3_NEW_CHANGED_PROMPTS": "1",
     "ARC3_LEVEL_TRANSFER_GUIDANCE": "1",
     "ARC3_ACTION_INFO": "1",
     "ARC3_DEDUPE_MULTICALL_LINE": "1",
     "ARC3_FRAME_DIFF_HINT": "1",
-    "ARC3_PREFER_TOOL_CALLS": "1",
 
     # Multimodal vision & animations (verified 18x jump on Qwen3.8-27B-FP8)
     "MULTIMODAL_CONTEXT": "current_grid",
@@ -598,21 +599,23 @@ bm.job_dir = WORKING_DIR
 
 import inference.agent.tool_agent as _ta
 import inference.framework.solver as _sv
-assert _ta._LOCAL_ANALYZER_CONTEXT_WINDOW == 112 * 1024, _ta._LOCAL_ANALYZER_CONTEXT_WINDOW
-assert _ta._LOCAL_ANALYZER_MAX_OUTPUT == 8 * 1024, _ta._LOCAL_ANALYZER_MAX_OUTPUT
+assert _ta._LOCAL_ANALYZER_CONTEXT_WINDOW == (116 + 12) * 1024, _ta._LOCAL_ANALYZER_CONTEXT_WINDOW
+assert _ta._LOCAL_ANALYZER_MAX_OUTPUT == 12 * 1024, _ta._LOCAL_ANALYZER_MAX_OUTPUT
 assert _ta._LOCAL_ANALYZER_YIELD_TOKENS == 2048, _ta._LOCAL_ANALYZER_YIELD_TOKENS
 assert _ta._LOCAL_ANALYZER_TOOL_STEPS == 0, _ta._LOCAL_ANALYZER_TOOL_STEPS
 assert _ta._LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS == 3072, _ta._LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS
 assert _ta._DIFF_IMAGE is True, _ta._DIFF_IMAGE
+assert _ta._prefer_tool_calls() is False, _ta._prefer_tool_calls()
 assert _sv.ANIMATION_ENABLED is True, _sv.ANIMATION_ENABLED
 assert _sv.ACTION_ECHO is True, _sv.ACTION_ECHO
 assert _sv.GUARDS_FROM_LEVEL == 2, _sv.GUARDS_FROM_LEVEL
 assert _sv.BATCH_NOOP_BLOCK is True, _sv.BATCH_NOOP_BLOCK
 assert _sv.STALE_STATE_BLOCK is True, _sv.STALE_STATE_BLOCK
 print(
-    f"Verified live harness constants: ctx={_ta._LOCAL_ANALYZER_CONTEXT_WINDOW}, "
-    f"max_out={_ta._LOCAL_ANALYZER_MAX_OUTPUT}, yield_tok={_ta._LOCAL_ANALYZER_YIELD_TOKENS}, "
-    f"diff_img={_ta._DIFF_IMAGE}, anim={_sv.ANIMATION_ENABLED}, guards_lvl={_sv.GUARDS_FROM_LEVEL}",
+    f"Verified live harness constants: model={SERVED_MODEL_NAME}, use_lora={USE_LORA}, "
+    f"ctx={_ta._LOCAL_ANALYZER_CONTEXT_WINDOW}, max_out={_ta._LOCAL_ANALYZER_MAX_OUTPUT}, "
+    f"yield_tok={_ta._LOCAL_ANALYZER_YIELD_TOKENS}, diff_img={_ta._DIFF_IMAGE}, "
+    f"anim={_sv.ANIMATION_ENABLED}, prefer_tools={_ta._prefer_tool_calls()}, guards_lvl={_sv.GUARDS_FROM_LEVEL}",
     flush=True,
 )
 
