@@ -1,0 +1,27 @@
+{
+  "id": "johnnyhyland/arc3-flash-next-v3-1",
+  "title": "ARC3 Flash Next v3.1",
+  "code_file": "arc3-flash-next-v3-1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "dfranzen/pennyroyal-v253",
+    "dfranzen/taaf-kaggle-source-bundle-copy",
+    "johnnyhyland/arc3-qwen38-27b-grpo-lora"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "arc-prize-2026-arc-agi-3"
+  ],
+  "model_sources": [
+    "dfranzen/albucino-qwen3-8-flash-next-drafter/Transformers/default/1",
+    "dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/Transformers/default/1"
+  ]
+}

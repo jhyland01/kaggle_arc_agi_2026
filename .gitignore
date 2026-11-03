@@ -7,3 +7,4 @@ __pycache__/
 arc.tar.gz
 runs/grpo1/final_adapter/*.safetensors
 kaggle_dataset/
+.DS_Store

@@ -122,6 +122,32 @@ def _level_transfer_guidance_enabled() -> bool:
     return _get_env_bool("ARC3_LEVEL_TRANSFER_GUIDANCE", False)
 
 
+def _harness_v2_enabled() -> bool:
+    """Opt-in Flash-Next Harness v2 upgrades (prefix-safe compaction, anti-stall
+    escalation, cross-drain notes/completed-levels ledger, and sandbox BFS helpers)."""
+    return _get_env_bool("ARC3_HARNESS_V2", False)
+
+
+_HARNESS_V2_SYSTEM_ADDENDUM = (
+    "\n\nPreloaded Python helpers (available in every `python` call without imports):\n"
+    "- `arc_rows(frame=None)` returns `(frame or current_frame).ascii.splitlines()` as a list of row strings.\n"
+    "- `arc_note(key, text)` updates persistent `arc_notes` (`dict`) with verified mechanics/rules (e.g. `arc_note('doors', 'yellow switch toggles yellow walls')`) that survive context trimming and level changes.\n"
+)
+
+
+def _v2_stall_threshold() -> int:
+    return max(2, _get_env_int("ARC3_STALL_ALERT_THRESHOLD", 4))
+
+
+def _v2_stall_alert(streak: int) -> str:
+    return (
+        f"STALL ALERT ({streak} consecutive non-acting Python calls on this exact board state): "
+        "Stop running read-only hypothesis scripts. In your VERY NEXT `python` call, execute at "
+        "least one concrete in-game `action(...)` (a single discriminating probe or your best "
+        "move batch) to observe real environment feedback."
+    )
+
+
 def _contains_tool_call_markup(*chunks: str) -> bool:
     for chunk in chunks:
         lowered = chunk.lower()
@@ -2661,6 +2687,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
+    if _harness_v2_enabled():
+        prompt += _HARNESS_V2_SYSTEM_ADDENDUM
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
@@ -3585,6 +3613,12 @@ class ToolAgent:
         self._last_step_summary: dict[str, Any] | None = None
         self._last_action_call_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
+        self._v2_notes: dict[str, str] = {}
+        self._v2_completed_levels: list[str] = []
+        self._v2_recorded_transitions: set[tuple[int, int]] = set()
+        self._v2_inject_ledger_after_evict: bool = False
+        self._v2_non_acting_streak: int = 0
+        self._v2_last_streak_key: tuple[int, int] | None = None
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -3620,6 +3654,12 @@ class ToolAgent:
             self._turns_without_wm_update = 0
             self._pending_wm_rebuild_reason = ""
             self._pending_wm_revise_reason = ""
+            self._v2_notes = {}
+            self._v2_completed_levels = []
+            self._v2_recorded_transitions = set()
+            self._v2_inject_ledger_after_evict = False
+            self._v2_non_acting_streak = 0
+            self._v2_last_streak_key = None
 
     @property
     def total_tokens(self) -> int:
@@ -4803,6 +4843,40 @@ class ToolAgent:
             lines.append(f"Current state: step {step}, level {level}.")
         return lines
 
+    def _v2_observe_level_transition(
+        self,
+        current_level: int,
+        current_step: int,
+        previous_step_summary: dict[str, Any] | None,
+    ) -> None:
+        if not previous_step_summary or previous_step_summary.get("stale"):
+            return
+        if not previous_step_summary.get("level_transition"):
+            return
+        cleared_level = max(1, int(current_level) - 1)
+        end_step = max(0, int(current_step) - 1)
+        key = (cleared_level, end_step)
+        if key in self._v2_recorded_transitions:
+            return
+        self._v2_recorded_transitions.add(key)
+        actions = previous_step_summary.get("executed_actions")
+        final_act = ""
+        if isinstance(actions, list) and actions:
+            final_act = str(actions[-1]).strip()
+        suffix = f" (final action: {final_act!r})" if final_act else ""
+        self._v2_completed_levels.append(f"L{cleared_level} cleared at step {end_step}{suffix}")
+
+    def _v2_ledger_lines(self) -> list[str]:
+        out: list[str] = []
+        if self._v2_completed_levels:
+            out.append(
+                "Completed levels so far: " + "; ".join(self._v2_completed_levels[-12:]) + "."
+            )
+        if self._v2_notes:
+            rendered_notes = " | ".join(f"{k}: {v}" for k, v in self._v2_notes.items())
+            out.append(f"Saved `arc_notes`: {rendered_notes}")
+        return out
+
     def _build_user_prompt(
         self,
         action_num: int,
@@ -5100,6 +5174,37 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
+        if _harness_v2_enabled():
+            self._v2_observe_level_transition(current_level, current_step, previous_step_summary)
+            is_fresh_level_transition = bool(
+                previous_step_summary
+                and not previous_step_summary.get("stale")
+                and previous_step_summary.get("level_transition")
+            )
+            inject_after_evict = bool(
+                getattr(self, "_v2_inject_ledger_after_evict", False)
+                and not getattr(self, "_resume_after_yield", False)
+            )
+            if is_fresh_level_transition or inject_after_evict:
+                lines.extend(self._v2_ledger_lines())
+                if inject_after_evict:
+                    self._v2_inject_ledger_after_evict = False
+            if action_num > 0 and _memory_sections_disabled() and not inject_after_evict:
+                lines.extend(
+                    [
+                        "For the most recent change, compare `previous_frame` to `current_frame` (`history[-1].frame` is the current frame); separate gameplay-object changes from HUD/timer bars.",
+                        "Use `python` (`current_frame.segmentation`, `frame_diff()`, `arc_rows()`, `arc_note()`) to inspect or search, then call `action(actions)` with a reliable batch or probe. You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
+                    ]
+                )
+                if "MOUSE" in _normalize_valid_actions(valid_actions):
+                    lines.append("If you use MOUSE, include integer row and col arguments.")
+                if _opener_commit_hint():
+                    lines.append(
+                        "When your evidence supports a choice, call `action(actions)` with the "
+                        "sequence it supports. Probe with a single action when you genuinely "
+                        "need to distinguish two possibilities; otherwise batch the route you have."
+                    )
+                return "\n".join(lines)
         lines.extend(
             [
                 "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_call_result`, `frame_diff(before, after)`, and `action(actions)`.",
@@ -5902,7 +6007,11 @@ class ToolAgent:
             kept_functions=self._retained_sources(),
             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
+            harness_v2=_harness_v2_enabled(),
+            arc_notes=getattr(self, "_v2_notes", None) if _harness_v2_enabled() else None,
         )
+        if _harness_v2_enabled() and isinstance(sandbox_result.get("arc_notes"), dict):
+            self._v2_notes = dict(sandbox_result["arc_notes"])
 
         action_results = [
             item
@@ -6309,6 +6418,7 @@ class ToolAgent:
         # second stays set so summaries remain visible after history is lost.
         self._context_was_trimmed = True
         self._has_evicted = True
+        self._v2_inject_ledger_after_evict = True
 
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         original_history = messages[1:]
@@ -6637,6 +6747,13 @@ class ToolAgent:
         resume_reason = str(getattr(self, "_resume_reason", "") or "yield_bare")
         self._resume_after_yield = False
         self._resume_reason = ""
+        if _harness_v2_enabled():
+            _cur_lvl = current_frame.level if current_frame is not None else 1
+            _cur_stp = current_frame.step if current_frame is not None else action_num
+            _streak_key = (_cur_lvl, _cur_stp)
+            if getattr(self, "_v2_last_streak_key", None) != _streak_key:
+                self._v2_last_streak_key = _streak_key
+                self._v2_non_acting_streak = 0
         if not resuming_after_yield and _persistent_functions_scope() == "turn":
             # A resumption is the same turn, so helpers survive it either way.
             if _persistent_functions() and getattr(self, "_kept_functions", None):
@@ -6665,18 +6782,27 @@ class ToolAgent:
             # the turn cache for this one message
             self._pending_diff_image = self._turn_diff_image
             self._pending_diff_image_label = self._turn_diff_image_label
+        _v2_resume_extra: list[str] = []
+        if resuming_after_yield and _harness_v2_enabled():
+            if getattr(self, "_v2_inject_ledger_after_evict", False):
+                _v2_resume_extra.extend(self._v2_ledger_lines())
+                self._v2_inject_ledger_after_evict = False
+            if getattr(self, "_v2_non_acting_streak", 0) >= _v2_stall_threshold():
+                _v2_resume_extra.append(_v2_stall_alert(self._v2_non_acting_streak))
+        _v2_resume_suffix = ("\n\n" + "\n".join(_v2_resume_extra)) if _v2_resume_extra else ""
         if resume_mode == "state_only":
             opening_message = self._build_user_message(
-                _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION,
+                _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION + _v2_resume_suffix,
                 current_frame,
             )
         elif resume_mode == "short":
             opening_message = self._build_user_message(
-                _yield_resume_prompt(resume_reason), resume_frame
+                _yield_resume_prompt(resume_reason) + _v2_resume_suffix, resume_frame
             )
         else:
             opening_message = self._build_user_message(
-                user_prompt, resume_frame if resuming_after_yield else current_frame
+                user_prompt + (_v2_resume_suffix if resuming_after_yield else ""),
+                resume_frame if resuming_after_yield else current_frame,
             )
         # log what was actually SENT, not the argument that was passed in: on a
         # resumed invocation the short/state_only substitution happens here, so
@@ -6977,6 +7103,8 @@ class ToolAgent:
                                 "stub",
                             )
                         self._append_context_message(messages, assistant_message)
+                    if _harness_v2_enabled():
+                        self._v2_non_acting_streak = getattr(self, "_v2_non_acting_streak", 0) + 1
                     yielded_control_reason = control_yield_reason()
                     if yielded_control_reason is not None:
                         break
@@ -7004,37 +7132,51 @@ class ToolAgent:
                             "Emit exactly one `python` tool call directly as your next response. "
                             "Do not place `<tool_call>` markup inside reasoning, explanation, or notes. "
                         )
-                    # the clause names where transient facts SHOULD go, so it
-                    # holds only while that section is carried; a mode that
-                    # drops it would be pointing the model nowhere
-                    _transient_clause = (
-                        " \u2014 current positions and this turn's events go in "
-                        "`Recent findings:`. "
-                        if "Recent findings" in _advertised_section_labels()
-                        # "only" wants something to contrast against, and the
-                        # clause that supplied it names a section this mode has
-                        # dropped; keep the contrast, drop the destination
-                        else ", not current positions or what just happened. "
-                    )
-                    followup_prompt = (
-                        f"{followup_prefix}"
-                        "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
-                        # the same narrowing the opener applies: advertising a section a
-                        # restricted mode drops invites the model to write
-                        # where it will never read it back
-                        f"If helpful, include memory update lines such as "
-                        f"{_section_list_phrase(_advertised_section_labels(), 'or')}. "
-                        "`World model:` holds durable environment rules"
-                        + (" only" if "Recent findings" in _advertised_section_labels() else "")
-                        + f"{_transient_clause}"
-                        "Each section you write replaces the stored one entirely, "
-                        "so restate what is still true, not only what is new. "
-                        "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
-                        "compare `previous_frame` to `current_frame` for the most recent change, "
-                        "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
-                        "then call `action(actions)` inside Python with the best valid action or ordered batch that your code selected. "
-                        f"{TOOL_CALL_FORMAT_GUIDANCE}"
-                    )
+                    if _harness_v2_enabled() and _memory_sections_disabled():
+                        _stall_prefix = (
+                            _v2_stall_alert(self._v2_non_acting_streak) + " "
+                            if self._v2_non_acting_streak >= _v2_stall_threshold()
+                            else ""
+                        )
+                        followup_prompt = (
+                            f"{_stall_prefix}{followup_prefix}"
+                            "Call the `python` tool with compact code (`current_frame.segmentation`, "
+                            "`frame_diff()`, `arc_rows()`, `arc_note()`) to inspect or search, then call "
+                            "`action(actions)` inside Python with your best probe or ordered batch. "
+                            f"{TOOL_CALL_FORMAT_GUIDANCE}"
+                        )
+                    else:
+                        # the clause names where transient facts SHOULD go, so it
+                        # holds only while that section is carried; a mode that
+                        # drops it would be pointing the model nowhere
+                        _transient_clause = (
+                            " \u2014 current positions and this turn's events go in "
+                            "`Recent findings:`. "
+                            if "Recent findings" in _advertised_section_labels()
+                            # "only" wants something to contrast against, and the
+                            # clause that supplied it names a section this mode has
+                            # dropped; keep the contrast, drop the destination
+                            else ", not current positions or what just happened. "
+                        )
+                        followup_prompt = (
+                            f"{followup_prefix}"
+                            "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
+                            # the same narrowing the opener applies: advertising a section a
+                            # restricted mode drops invites the model to write
+                            # where it will never read it back
+                            f"If helpful, include memory update lines such as "
+                            f"{_section_list_phrase(_advertised_section_labels(), 'or')}. "
+                            "`World model:` holds durable environment rules"
+                            + (" only" if "Recent findings" in _advertised_section_labels() else "")
+                            + f"{_transient_clause}"
+                            "Each section you write replaces the stored one entirely, "
+                            "so restate what is still true, not only what is new. "
+                            "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
+                            "compare `previous_frame` to `current_frame` for the most recent change, "
+                            "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
+                            "then call `action(actions)` inside Python with the best valid action or ordered batch that your code selected. "
+                            f"{TOOL_CALL_FORMAT_GUIDANCE}"
+                        )
                     append_transcript("USER PROMPT", followup_prompt)
                     self._append_context_message(
                         messages,
@@ -7071,8 +7213,11 @@ class ToolAgent:
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
                     dispatch = self._dispatch_tool(state_path, tool_name, arguments)
+                    tool_message_content = dispatch.content
                     if dispatch.step_executed:
                         step_executed = True
+                        if _harness_v2_enabled():
+                            self._v2_non_acting_streak = 0
                         if self._reasoning_effort_rung >= 0 and dispatch.made_progress:
                             # the turn achieved something, so restore the server
                             # default; an inert action leaves the reduction in
@@ -7081,13 +7226,20 @@ class ToolAgent:
                                 "action changed the board; restoring default reasoning_effort"
                             )
                             self._reasoning_effort_rung = -1
-                    append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))
+                    elif _harness_v2_enabled():
+                        self._v2_non_acting_streak = getattr(self, "_v2_non_acting_streak", 0) + 1
+                        if self._v2_non_acting_streak >= _v2_stall_threshold():
+                            tool_message_content = (
+                                f"{tool_message_content}\n"
+                                f"[{_v2_stall_alert(self._v2_non_acting_streak)}]"
+                            )
+                    append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(tool_message_content))
                     self._append_context_message(
                         messages,
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.get("id", ""),
-                            "content": dispatch.content,
+                            "content": tool_message_content,
                         }
                     )
                     if dispatch.step_executed:

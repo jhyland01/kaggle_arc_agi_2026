@@ -641,6 +641,88 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
         _refresh_state(initial.get("state") or {})
 
+        _harness_v2 = bool(initial.get("harness_v2"))
+        _arc_notes = {}
+        if _harness_v2:
+            import collections as _collections
+
+            raw_notes = initial.get("arc_notes")
+            if isinstance(raw_notes, dict):
+                for _nk, _nv in raw_notes.items():
+                    _sk = str(_nk or "").strip()[:64]
+                    _sv = " ".join(str(_nv or "").split())[:320]
+                    if _sk and _sv:
+                        _arc_notes[_sk] = _sv
+
+            def arc_rows(frame=None):
+                target = runtime_globals.get("current_frame") if frame is None else frame
+                if target is None:
+                    return []
+                return str(getattr(target, "ascii", "") or "").splitlines()
+
+            def arc_find(chars, frame=None):
+                rows = arc_rows(frame)
+                pred = chars if callable(chars) else (lambda ch, _s=set(chars): ch in _s)
+                hits = []
+                for r_idx, row_str in enumerate(rows):
+                    for c_idx, ch in enumerate(row_str):
+                        if pred(ch):
+                            hits.append((r_idx, c_idx, ch))
+                return hits
+
+            def arc_bfs(start, is_goal, neighbors_fn, max_nodes=50000):
+                if is_goal(start):
+                    return [], start
+                queue_dq = _collections.deque([start])
+                parent = {start: None}
+                expanded = 0
+                limit = max(1, int(max_nodes))
+                while queue_dq and expanded < limit:
+                    cur = queue_dq.popleft()
+                    expanded += 1
+                    for step_act, nxt in neighbors_fn(cur):
+                        if nxt in parent:
+                            continue
+                        if isinstance(step_act, (list, tuple)):
+                            act_tuple = tuple(step_act)
+                        else:
+                            act_tuple = (step_act,)
+                        parent[nxt] = (cur, act_tuple)
+                        if is_goal(nxt):
+                            rev_chunks = []
+                            node = nxt
+                            while parent[node] is not None:
+                                prev_node, chunk = parent[node]
+                                rev_chunks.append(chunk)
+                                node = prev_node
+                            path = []
+                            for chunk in reversed(rev_chunks):
+                                path.extend(chunk)
+                            return path, nxt
+                        queue_dq.append(nxt)
+                return None, None
+
+            def arc_note(key, value=None):
+                k = str(key or "").strip()[:64]
+                if not k:
+                    return dict(_arc_notes)
+                if value is None or not str(value).strip():
+                    _arc_notes.pop(k, None)
+                else:
+                    if k in _arc_notes:
+                        _arc_notes.pop(k, None)
+                    elif len(_arc_notes) >= 16:
+                        _arc_notes.pop(next(iter(_arc_notes)), None)
+                    _arc_notes[k] = " ".join(str(value).split())[:320]
+                runtime_globals["arc_notes"] = dict(_arc_notes)
+                return dict(_arc_notes)
+
+            runtime_globals["arc_rows"] = arc_rows
+            runtime_globals["arc_find"] = arc_find
+            runtime_globals["arc_bfs"] = arc_bfs
+            runtime_globals["arc_note"] = arc_note
+            runtime_globals["arc_notes"] = dict(_arc_notes)
+
         _persistence_enabled = bool(initial.get("persistence_enabled"))
         _retention_options = {
             "retain_imports": bool(initial.get("retain_imports")),
@@ -700,6 +782,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "final",
                     **_collect_retention_payload(),
+                    **({"arc_notes": dict(_arc_notes)} if _harness_v2 else {}),
                     "stdout": stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
@@ -724,6 +807,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "error",
                     **_collect_retention_payload(),
+                    **({"arc_notes": dict(_arc_notes)} if _harness_v2 else {}),
                     "error": _sanitize_exception(exc),
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
@@ -813,6 +897,8 @@ def run_sandboxed_python(
     kept_functions: list[str] | None = None,
     retain_imports: bool = False,
     repair_hints: bool = False,
+    harness_v2: bool = False,
+    arc_notes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
@@ -855,6 +941,8 @@ def run_sandboxed_python(
                 "persistence_enabled": kept_functions is not None,
                 "retain_imports": retain_imports,
                 "repair_hints": repair_hints,
+                "harness_v2": bool(harness_v2),
+                "arc_notes": dict(arc_notes or {}),
                 "animation_enabled": animation_handler is not None,
                 "timeout_seconds": timeout_seconds,
                 "sandbox_cwd": sandbox_dir,
@@ -964,6 +1052,8 @@ def run_sandboxed_python(
                     "keepable_functions": list(message.get("keepable_functions") or []),
                     **({"retention_rejected": message.get("retention_rejected", [])}
                        if kept_functions is not None else {}),
+                    **({"arc_notes": dict(message.get("arc_notes") or {})}
+                       if harness_v2 else {}),
                 }
 
             _wait_for_process_exit(process)

@@ -1,0 +1,31 @@
+{
+  "id": "johnnyhyland/arc2-2026-hybrid-v1",
+  "title": "ARC2 2026 Hybrid v1",
+  "code_file": "arc2-2026-hybrid-v1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "mirzamilanfarabi/arc3-vllm-h100-wheelhouse-v3",
+    "keithtyser/taaf-duck-qwen38-serving-v1",
+    "konstantinboyko/flash-attn-2-8-2",
+    "johnnyhyland/arc3-qwen38-27b-grpo-lora"
+  ],
+  "kernel_sources": [
+    "konstantinboyko/unsloth-2025-9-7-torch-2-8-0-py3-12-patched"
+  ],
+  "competition_sources": [
+    "arc-prize-2026-arc-agi-2"
+  ],
+  "model_sources": [
+    "foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1",
+    "sorokin/qwen3_4b_grids15_sft139/Transformers/bfloat16/1",
+    "konstantinboyko/qwen3-4b-bfloat16-v02-01-01/Transformers/default/1"
+  ]
+}
